@@ -77,6 +77,7 @@ fn sources_list() -> anyhow::Result<()> {
 fn adapters_list() {
     for a in adapters::list() {
         println!("{}  {}  [{}]", a.id, a.name, a.status);
+        println!("    {}", adapters::caps_summary(&a.capabilities));
     }
 }
 
