@@ -3,18 +3,20 @@
 //! Every source maps into these types. Measured and estimated values are kept
 //! separate via [`Confidence`]; callers must label any mixed total.
 
+mod adapter;
 mod confidence;
 mod model;
+mod source;
 mod warning;
 
+pub use adapter::{validate_parsed, Adapter, Detection, Fixture, ParsedData};
 pub use confidence::Confidence;
 pub use model::{
     CostUsage, DiffSummary, FileEvent, GitCommit, Millis, ModelRequest, Session, SessionStatus,
     Timestamp, TokenUsage, ToolCall, Turn,
 };
+pub use source::{AgentSource, Capabilities, PrivacyLevel, SourceType};
 pub use warning::{Warning, WarningKind};
-
-// TODO(0.3.0): add AgentSource and its capability report alongside the adapter trait.
 
 #[cfg(test)]
 mod tests {

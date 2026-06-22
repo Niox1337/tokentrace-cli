@@ -7,7 +7,8 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
+use tokentrace_core::AgentSource;
 
 /// Bumped only when the embedded schema changes in a non-additive way.
 const SCHEMA_VERSION: i64 = 1;
@@ -193,6 +194,33 @@ pub fn list_sources(conn: &Connection) -> anyhow::Result<Vec<SourceRow>> {
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
+/// Register a configured source. Capabilities are reported to the user, not
+/// persisted; the `sources` table tracks identity and provenance only. Errors
+/// if a source with the same id is already registered.
+pub fn insert_source(conn: &Connection, src: &AgentSource) -> anyhow::Result<()> {
+    let existing: Option<i64> = conn
+        .query_row("SELECT 1 FROM sources WHERE id = ?1", [&src.id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if existing.is_some() {
+        anyhow::bail!("source '{}' is already registered", src.id);
+    }
+    conn.execute(
+        "INSERT INTO sources (id, name, source_type, adapter_id, adapter_version, imported_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            src.id,
+            src.name,
+            src.source_type.as_str(),
+            src.adapter_id,
+            src.adapter_version,
+            src.imported_at
+        ],
+    )?;
+    Ok(())
+}
+
 /// Store raw source bytes keyed by their SHA-256, deduplicating on the hash.
 /// Returns the content hash so callers can reference the preserved bytes.
 // TODO(0.4.0): called by importers; unused until the first adapter lands.
@@ -284,6 +312,29 @@ mod tests {
     fn empty_store_lists_no_sources() {
         let conn = memory_store();
         assert!(list_sources(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn insert_source_persists_and_rejects_duplicates() {
+        use tokentrace_core::{Capabilities, SourceType};
+
+        let conn = memory_store();
+        let src = AgentSource {
+            id: "abc123".to_string(),
+            name: "my logs".to_string(),
+            source_type: SourceType::LocalFile,
+            adapter_id: "claude-code".to_string(),
+            adapter_version: "0.0.0".to_string(),
+            capabilities: Capabilities::default(),
+            imported_at: Some(42),
+        };
+        insert_source(&conn, &src).unwrap();
+        let rows = list_sources(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "abc123");
+        assert_eq!(rows[0].source_type, "local_file");
+        // A second insert with the same id is rejected, not silently duplicated.
+        assert!(insert_source(&conn, &src).is_err());
     }
 
     #[test]

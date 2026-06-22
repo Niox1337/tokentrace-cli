@@ -1,4 +1,7 @@
+use std::path::{Path, PathBuf};
+
 use clap::{Parser, Subcommand};
+use tokentrace_core::{AgentSource, SourceType};
 
 mod adapters;
 mod git;
@@ -36,6 +39,18 @@ enum Command {
 enum SourcesCommand {
     /// List imported sources.
     List,
+    /// Register a local source file for an adapter.
+    Add {
+        /// Adapter id, e.g. claude-code.
+        #[arg(long)]
+        adapter: String,
+        /// Human-readable name for the source.
+        #[arg(long)]
+        name: String,
+        /// Path to the local source file.
+        #[arg(long)]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -51,6 +66,14 @@ fn main() -> anyhow::Result<()> {
         Command::Sources {
             command: SourcesCommand::List,
         } => sources_list()?,
+        Command::Sources {
+            command:
+                SourcesCommand::Add {
+                    adapter,
+                    name,
+                    path,
+                },
+        } => sources_add(adapter, name, path)?,
         Command::Adapters {
             command: AdaptersCommand::List,
         } => adapters_list(),
@@ -74,9 +97,61 @@ fn sources_list() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn sources_add(adapter: String, name: String, path: PathBuf) -> anyhow::Result<()> {
+    let info = adapters::find(&adapter).ok_or_else(|| {
+        anyhow::anyhow!("unknown adapter '{adapter}'; see `tokentrace adapters list`")
+    })?;
+    if !path.exists() {
+        anyhow::bail!("path does not exist: {}", path.display());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64);
+    let source = AgentSource {
+        id: source_id(&adapter, &name, &path),
+        name,
+        source_type: SourceType::LocalFile,
+        adapter_id: adapter,
+        adapter_version: info.version.to_string(),
+        capabilities: info.capabilities,
+        imported_at: now,
+    };
+
+    let conn = store::open(&store::default_store_path())?;
+    store::insert_source(&conn, &source)?;
+
+    println!("Added source '{}' ({})", source.name, source.id);
+    println!(
+        "  adapter:      {} {}",
+        source.adapter_id, source.adapter_version
+    );
+    println!(
+        "  capabilities: {}",
+        adapters::caps_summary(&source.capabilities)
+    );
+    Ok(())
+}
+
+/// A short, stable id for a local source, derived from its adapter, name, and path.
+fn source_id(adapter: &str, name: &str, path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(adapter.as_bytes());
+    h.update([0]);
+    h.update(name.as_bytes());
+    h.update([0]);
+    h.update(path.to_string_lossy().as_bytes());
+    h.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 fn adapters_list() {
     for a in adapters::list() {
         println!("{}  {}  [{}]", a.id, a.name, a.status);
+        println!("    {}", adapters::caps_summary(&a.capabilities));
     }
 }
 
