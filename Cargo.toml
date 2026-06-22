@@ -2,11 +2,6 @@
 resolver = "2"
 members = [
     "crates/tokentrace-core",
-    "crates/tokentrace-store",
-    "crates/tokentrace-adapters",
-    "crates/tokentrace-adapter-claude-code",
-    "crates/tokentrace-git",
-    "crates/tokentrace-tui",
     "crates/tokentrace-cli",
 ]
 
@@ -18,7 +13,6 @@ repository = "https://github.com/Niox1337/tokentrace-cli"
 
 [workspace.dependencies]
 tokentrace-core = { path = "crates/tokentrace-core" }
-tokentrace-store = { path = "crates/tokentrace-store" }
 
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
