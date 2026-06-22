@@ -1,4 +1,4 @@
-//! TokenTrace storage: SQLite-backed store and status reporting.
+//! SQLite-backed store and status reporting.
 //!
 //! Milestone 0.1.0 only locates the store and reports whether it exists; the
 //! schema and migrations arrive in 0.2.0.

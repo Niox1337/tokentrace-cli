@@ -1,5 +1,10 @@
 use clap::{Parser, Subcommand};
 
+mod adapters;
+mod git;
+mod store;
+mod tui;
+
 #[derive(Parser)]
 #[command(
     name = "tokentrace",
@@ -32,7 +37,7 @@ fn doctor() {
         std::env::consts::ARCH
     );
 
-    let status = tokentrace_store::status(tokentrace_store::default_store_path());
+    let status = store::status(store::default_store_path());
     println!("  store: {}", status.path.display());
     if status.exists {
         let size = status.size_bytes.unwrap_or(0);
