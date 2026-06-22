@@ -72,7 +72,10 @@ pub trait Adapter {
 
     /// Fetch raw bytes from an API source. Local-file adapters never need this.
     fn fetch(&self) -> Result<Vec<u8>> {
-        anyhow::bail!("adapter '{}' has no API fetch; it reads local files", self.id())
+        anyhow::bail!(
+            "adapter '{}' has no API fetch; it reads local files",
+            self.id()
+        )
     }
 
     /// Flag malformed records in parsed data. Defaults to the shared structural
