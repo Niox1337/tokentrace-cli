@@ -34,6 +34,11 @@ pub fn list() -> Vec<AdapterInfo> {
     }]
 }
 
+/// Look up a bundled adapter by id.
+pub fn find(id: &str) -> Option<AdapterInfo> {
+    list().into_iter().find(|a| a.id == id)
+}
+
 /// A one-line summary of an adapter's capabilities for CLI output.
 pub fn caps_summary(c: &Capabilities) -> String {
     let flags = [
@@ -45,9 +50,17 @@ pub fn caps_summary(c: &Capabilities) -> String {
         (c.git_signals, "git"),
         (c.raw_bodies, "raw-bodies"),
     ];
-    let mut parts: Vec<&str> = flags.iter().filter(|(on, _)| *on).map(|(_, l)| *l).collect();
+    let mut parts: Vec<&str> = flags
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, l)| *l)
+        .collect();
     if parts.is_empty() {
         parts.push("none");
     }
-    format!("{}; privacy: {}", parts.join(", "), c.privacy_level.as_str())
+    format!(
+        "{}; privacy: {}",
+        parts.join(", "),
+        c.privacy_level.as_str()
+    )
 }
