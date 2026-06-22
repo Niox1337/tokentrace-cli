@@ -1,0 +1,16 @@
+[package]
+name = "tokentrace-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tokentrace"
+path = "src/main.rs"
+
+[dependencies]
+tokentrace-core = { workspace = true }
+tokentrace-store = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
