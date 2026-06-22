@@ -6,6 +6,4 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-tokentrace-core = { workspace = true }
 rusqlite = { workspace = true }
-anyhow = { workspace = true }
