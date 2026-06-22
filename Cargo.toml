@@ -3,6 +3,10 @@ resolver = "2"
 members = [
     "crates/tokentrace-core",
     "crates/tokentrace-store",
+    "crates/tokentrace-adapters",
+    "crates/tokentrace-adapter-claude-code",
+    "crates/tokentrace-git",
+    "crates/tokentrace-tui",
     "crates/tokentrace-cli",
 ]
 

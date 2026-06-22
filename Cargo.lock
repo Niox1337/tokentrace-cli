@@ -327,6 +327,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokentrace-adapter-claude-code"
+version = "0.1.0"
+
+[[package]]
+name = "tokentrace-adapters"
+version = "0.1.0"
+
+[[package]]
 name = "tokentrace-cli"
 version = "0.1.0"
 dependencies = [
@@ -345,6 +353,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokentrace-git"
+version = "0.1.0"
+
+[[package]]
 name = "tokentrace-store"
 version = "0.1.0"
 dependencies = [
@@ -352,6 +364,10 @@ dependencies = [
  "rusqlite",
  "tokentrace-core",
 ]
+
+[[package]]
+name = "tokentrace-tui"
+version = "0.1.0"
 
 [[package]]
 name = "unicode-ident"
