@@ -3,11 +3,13 @@
 //! Every source maps into these types. Measured and estimated values are kept
 //! separate via [`Confidence`]; callers must label any mixed total.
 
+mod adapter;
 mod confidence;
 mod model;
 mod source;
 mod warning;
 
+pub use adapter::{Adapter, Detection, Fixture, ParsedData};
 pub use confidence::Confidence;
 pub use model::{
     CostUsage, DiffSummary, FileEvent, GitCommit, Millis, ModelRequest, Session, SessionStatus,
