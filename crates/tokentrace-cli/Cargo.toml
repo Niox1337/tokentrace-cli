@@ -10,7 +10,5 @@ name = "tokentrace"
 path = "src/main.rs"
 
 [dependencies]
-tokentrace-core = { workspace = true }
 tokentrace-store = { workspace = true }
 clap = { workspace = true }
-anyhow = { workspace = true }
