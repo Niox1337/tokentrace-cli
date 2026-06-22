@@ -12,3 +12,5 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 rusqlite = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
