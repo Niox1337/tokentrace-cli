@@ -9,7 +9,7 @@ mod model;
 mod source;
 mod warning;
 
-pub use adapter::{Adapter, Detection, Fixture, ParsedData};
+pub use adapter::{validate_parsed, Adapter, Detection, Fixture, ParsedData};
 pub use confidence::Confidence;
 pub use model::{
     CostUsage, DiffSummary, FileEvent, GitCommit, Millis, ModelRequest, Session, SessionStatus,
