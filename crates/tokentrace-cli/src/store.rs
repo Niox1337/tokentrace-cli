@@ -618,6 +618,142 @@ pub fn overview(conn: &Connection) -> anyhow::Result<Overview> {
     })
 }
 
+/// Token totals for one confidence band, split by component. Kept apart from
+/// the other band so measured and estimated are never summed together.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenParts {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+    pub total: u64,
+}
+
+/// Store-wide token components, with measured and estimated held separately.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenBreakdown {
+    pub measured: TokenParts,
+    pub estimated: TokenParts,
+}
+
+/// Cost rolled up to one model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CostByModel {
+    pub model: String,
+    pub amount_minor: i64,
+    pub currency: Option<String>,
+}
+
+/// How often a tool was called and how many of those calls failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolUsage {
+    pub name: String,
+    pub calls: u64,
+    pub failures: u64,
+}
+
+/// Net edit impact on one file path across all sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileImpact {
+    pub path: String,
+    pub writes: u64,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+}
+
+/// Everything the breakdown screen shows. Empty on a fresh store.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Breakdown {
+    pub tokens: TokenBreakdown,
+    pub cost_by_model: Vec<CostByModel>,
+    pub tools: Vec<ToolUsage>,
+    pub files: Vec<FileImpact>,
+}
+
+/// Aggregate token components, cost by model, tool usage, and file impact for
+/// the breakdown screen. Measured and estimated token sums stay separate.
+pub fn breakdown(conn: &Connection) -> anyhow::Result<Breakdown> {
+    let mut tokens = TokenBreakdown::default();
+    let mut tok_stmt = conn.prepare(
+        "SELECT confidence, SUM(input), SUM(output), SUM(cache_read), \
+                SUM(cache_creation), SUM(total) \
+         FROM usage GROUP BY confidence",
+    )?;
+    let rows = tok_stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            TokenParts {
+                input: r.get::<_, i64>(1)? as u64,
+                output: r.get::<_, i64>(2)? as u64,
+                cache_read: r.get::<_, i64>(3)? as u64,
+                cache_creation: r.get::<_, i64>(4)? as u64,
+                total: r.get::<_, i64>(5)? as u64,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (conf, parts) = row?;
+        match conf.as_str() {
+            "measured" => tokens.measured = parts,
+            "estimated" => tokens.estimated = parts,
+            _ => {}
+        }
+    }
+
+    let mut cost_stmt = conn.prepare(
+        "SELECT r.model, SUM(c.amount_minor), MAX(c.currency) \
+         FROM costs c JOIN requests r ON r.id = c.request_id \
+         GROUP BY r.model ORDER BY SUM(c.amount_minor) DESC",
+    )?;
+    let cost_by_model = cost_stmt
+        .query_map([], |r| {
+            Ok(CostByModel {
+                model: r.get(0)?,
+                amount_minor: r.get(1)?,
+                currency: r.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut tool_stmt = conn.prepare(
+        "SELECT name, COUNT(*), SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) \
+         FROM tools GROUP BY name ORDER BY COUNT(*) DESC, name",
+    )?;
+    let tools = tool_stmt
+        .query_map([], |r| {
+            Ok(ToolUsage {
+                name: r.get(0)?,
+                calls: r.get::<_, i64>(1)? as u64,
+                failures: r.get::<_, i64>(2)? as u64,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut file_stmt = conn.prepare(
+        "SELECT path, SUM(is_write), SUM(COALESCE(lines_added, 0)), \
+                SUM(COALESCE(lines_removed, 0)) \
+         FROM files GROUP BY path \
+         ORDER BY SUM(COALESCE(lines_added, 0) + COALESCE(lines_removed, 0)) DESC, path",
+    )?;
+    let files = file_stmt
+        .query_map([], |r| {
+            Ok(FileImpact {
+                path: r.get(0)?,
+                writes: r.get::<_, i64>(1)? as u64,
+                lines_added: r.get(2)?,
+                lines_removed: r.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Breakdown {
+        tokens,
+        cost_by_model,
+        tools,
+        files,
+    })
+}
+
 /// Load the full detail for one session. Returns `None` if the id is unknown.
 pub fn session_detail(conn: &Connection, id: &str) -> anyhow::Result<Option<SessionDetail>> {
     let summary = session_summaries(conn)?.into_iter().find(|s| s.id == id);
@@ -888,6 +1024,7 @@ mod tests {
         assert_eq!(ov, Overview::default());
         assert!(session_summaries(&conn).unwrap().is_empty());
         assert!(session_detail(&conn, "missing").unwrap().is_none());
+        assert_eq!(breakdown(&conn).unwrap(), Breakdown::default());
     }
 
     #[test]
@@ -1011,6 +1148,20 @@ mod tests {
         assert_eq!(detail.requests.len(), 2);
         assert_eq!(detail.tools.len(), 1);
         assert_eq!(detail.warnings.len(), 1);
+
+        let bd = breakdown(&conn).unwrap();
+        // Components add up within each band and the bands never mix.
+        assert_eq!(bd.tokens.measured.input, 100);
+        assert_eq!(bd.tokens.measured.output, 20);
+        assert_eq!(bd.tokens.measured.total, 120);
+        assert_eq!(bd.tokens.estimated.input, 30);
+        assert_eq!(bd.tokens.estimated.total, 40);
+        assert_eq!(bd.cost_by_model.len(), 1);
+        assert_eq!(bd.cost_by_model[0].amount_minor, 15);
+        assert_eq!(bd.tools.len(), 1);
+        assert_eq!(bd.tools[0].name, "Edit");
+        assert_eq!(bd.tools[0].calls, 1);
+        assert_eq!(bd.tools[0].failures, 0);
     }
 
     #[test]
