@@ -18,10 +18,13 @@ use std::fmt::Write as _;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use tokentrace_core::{
-    validate_parsed, Adapter, Capabilities, Confidence, CostUsage, Detection, ModelRequest,
-    ParsedData, PrivacyLevel, Session, SessionStatus, TokenUsage, ToolCall, Turn, Warning,
-    WarningKind,
+    validate_parsed, Adapter, Capabilities, Confidence, CostUsage, Detection, Fixture,
+    ModelRequest, ParsedData, PrivacyLevel, Session, SessionStatus, TokenUsage, ToolCall, Turn,
+    Warning, WarningKind,
 };
+
+/// One redacted OTLP/JSON logs export covering api_request and tool_result events.
+const FIXTURE_OTLP_LOGS: &[u8] = include_bytes!("../../../../fixtures/claude-code/otlp_logs.json");
 
 /// Adapter id used on the CLI and in stored source rows.
 pub const ID: &str = "claude-code";
@@ -76,6 +79,13 @@ impl Adapter for ClaudeCode {
         let mut warnings = validate_parsed(data);
         warnings.extend(privacy_warnings(data));
         warnings
+    }
+
+    fn fixtures(&self) -> Vec<Fixture> {
+        vec![Fixture {
+            name: "otlp_logs",
+            bytes: FIXTURE_OTLP_LOGS,
+        }]
     }
 }
 
@@ -547,6 +557,40 @@ mod tests {
         assert_eq!(data.tokens[0].total, 350);
         assert_eq!(data.tokens[0].confidence, Confidence::Measured);
         assert_eq!(data.costs[0].amount_minor, 42);
+    }
+
+    #[test]
+    fn fixture_parses_to_expected_model_output() {
+        let data = ClaudeCode.parse(FIXTURE_OTLP_LOGS).unwrap();
+        // One session, two prompts (turns), two requests, one tool call.
+        assert_eq!(data.sessions.len(), 1);
+        assert_eq!(data.turns.len(), 2);
+        assert_eq!(data.requests.len(), 2);
+        assert_eq!(data.tools.len(), 1);
+        // Raw session id is never stored; only its hash is kept.
+        assert_ne!(
+            data.sessions[0].external_id_hash,
+            "00000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(data.sessions[0].id.len(), 16);
+        // First request: measured token total and estimated cost in cents.
+        assert_eq!(data.requests[0].model, "claude-sonnet-4-6");
+        assert_eq!(data.tokens[0].total, 1200 + 350 + 800 + 64);
+        assert_eq!(data.tokens[0].confidence, Confidence::Measured);
+        assert_eq!(data.costs[0].amount_minor, 21);
+        assert_eq!(data.costs[0].confidence, Confidence::Estimated);
+        // The tool call attaches to the same turn as its api_request.
+        assert_eq!(data.tools[0].name, "Edit");
+        assert_eq!(data.tools[0].turn_id, data.requests[0].turn_id);
+        // Tool attribution present, so only the file gate warns.
+        let warnings = ClaudeCode.validate(&data);
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.kind == WarningKind::Redaction)
+                .count(),
+            1
+        );
     }
 
     #[test]
