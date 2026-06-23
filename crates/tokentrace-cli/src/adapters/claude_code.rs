@@ -594,6 +594,16 @@ mod tests {
     }
 
     #[test]
+    fn malformed_source_errors_without_panicking() {
+        // Non-JSON input is a clean error, never a panic.
+        assert!(parse_otlp(b"not valid json").is_err());
+        // Valid JSON with no OTLP shape yields empty data, also without panic.
+        let data = parse_otlp(b"{}").unwrap();
+        assert!(data.requests.is_empty());
+        assert!(data.sessions.is_empty());
+    }
+
+    #[test]
     fn validate_warns_when_file_and_tool_attribution_missing() {
         let data = parse_otlp(&api_request_export()).unwrap();
         let warnings = ClaudeCode.validate(&data);
