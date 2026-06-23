@@ -45,6 +45,21 @@ enum Command {
         #[command(subcommand)]
         command: AdaptersCommand,
     },
+    /// Summarize the current git repo and attribute a cost across a commit range.
+    Git {
+        /// Start revision of the range (exclusive), e.g. a session's commit-before.
+        #[arg(long)]
+        from: Option<String>,
+        /// End revision of the range.
+        #[arg(long, default_value = "HEAD")]
+        to: String,
+        /// Session cost in minor currency units (e.g. cents) to attribute across the range.
+        #[arg(long)]
+        cost: Option<i64>,
+        /// Currency label for the attributed cost.
+        #[arg(long, default_value = "USD")]
+        currency: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -94,6 +109,84 @@ fn main() -> anyhow::Result<()> {
         Command::Adapters {
             command: AdaptersCommand::List,
         } => adapters_list(),
+        Command::Git {
+            from,
+            to,
+            cost,
+            currency,
+        } => git_summary(from, to, cost, currency)?,
+    }
+    Ok(())
+}
+
+/// Report the current repo, and when given a range and cost, attribute that cost
+/// per commit, file, and line, falling back to a session-level total when commit
+/// timing is ambiguous.
+fn git_summary(
+    from: Option<String>,
+    to: String,
+    cost: Option<i64>,
+    currency: String,
+) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let provider = git::GitProvider::discover(&cwd)?;
+    println!("repo:   {}", provider.root().display());
+    match provider.branch()? {
+        Some(b) => println!("branch: {b}"),
+        None => println!("branch: (detached HEAD)"),
+    }
+    println!("head:   {}", provider.head()?);
+
+    let Some(from) = from else {
+        return Ok(());
+    };
+    let stat = provider.diff_stat(&from, &to)?;
+    let times = provider.commit_times(&from, &to)?;
+    let lines = stat.additions + stat.deletions;
+    println!(
+        "range:  {from}..{to}  ({} commits, {} files, +{} -{})",
+        times.len(),
+        stat.files,
+        stat.additions,
+        stat.deletions
+    );
+
+    let Some(amount) = cost else {
+        return Ok(());
+    };
+    // Take the range's own commit span as the session window; the timing gate in
+    // `attribute` then rejects empty ranges and zero-change diffs as ambiguous.
+    let window = (
+        times.iter().copied().min().unwrap_or(0),
+        times.iter().copied().max().unwrap_or(0),
+    );
+    let usage = tokentrace_core::CostUsage {
+        amount_minor: amount,
+        currency,
+        pricing_source: "user".to_string(),
+        confidence: tokentrace_core::Confidence::Estimated,
+    };
+    let commit_times: Vec<Option<i64>> = times.into_iter().map(Some).collect();
+    match git::attribute(window, &commit_times, stat.files, lines, &usage) {
+        git::Attribution::PerCommit(a) => {
+            println!(
+                "cost:   {} {}/commit, {} {}/file, {} {}/line [{:?}]",
+                a.per_commit_minor,
+                a.currency,
+                a.per_file_minor,
+                a.currency,
+                a.per_line_minor,
+                a.currency,
+                a.confidence,
+            );
+        }
+        git::Attribution::SessionOnly(w) => {
+            println!(
+                "cost:   {} {} for the range (not attributed)",
+                usage.amount_minor, usage.currency
+            );
+            println!("        warning: {}", w.message);
+        }
     }
     Ok(())
 }
