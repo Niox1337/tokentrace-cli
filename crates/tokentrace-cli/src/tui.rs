@@ -30,6 +30,7 @@ pub enum Screen {
     Sessions,
     Detail,
     Breakdown,
+    Warnings,
 }
 
 /// The loaded, read-only view of the store plus cursor state. Loaded once at
@@ -41,6 +42,7 @@ pub struct App {
     pub adapters: Vec<adapters::AdapterInfo>,
     pub sessions: Vec<store::SessionSummary>,
     pub breakdown: store::Breakdown,
+    pub warnings: Vec<store::WarningRow>,
     pub screen: Screen,
     /// Cursor into `sessions` for the list and the opened detail.
     pub selected: usize,
@@ -57,6 +59,7 @@ impl App {
             adapters: adapters::list(),
             sessions: store::session_summaries(conn)?,
             breakdown: store::breakdown(conn)?,
+            warnings: store::warning_breakdown(conn)?,
             screen: Screen::Overview,
             selected: 0,
             detail: None,
@@ -107,6 +110,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('2') => app.screen = Screen::Sources,
         KeyCode::Char('3') => app.screen = Screen::Sessions,
         KeyCode::Char('4') => app.screen = Screen::Breakdown,
+        KeyCode::Char('5') => app.screen = Screen::Warnings,
         KeyCode::Up => {
             if app.screen == Screen::Sessions {
                 app.selected = app.selected.saturating_sub(1);
@@ -166,6 +170,7 @@ pub fn render(f: &mut Frame, app: &App) {
         Screen::Sessions => (" Sessions ", sessions_lines(app)),
         Screen::Detail => (" Session detail ", detail_lines(app)),
         Screen::Breakdown => (" Breakdown ", breakdown_lines(app)),
+        Screen::Warnings => (" Warnings ", warnings_lines(app)),
     };
     let body = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(body, chunks[1]);
@@ -179,6 +184,7 @@ fn tab_bar(current: Screen) -> Line<'static> {
         (Screen::Sources, "2 Sources"),
         (Screen::Sessions, "3 Sessions"),
         (Screen::Breakdown, "4 Breakdown"),
+        (Screen::Warnings, "5 Warnings"),
     ];
     let mut spans = vec![Span::raw("tokentrace  ")];
     for (screen, label) in tabs {
@@ -195,9 +201,9 @@ fn tab_bar(current: Screen) -> Line<'static> {
 
 fn footer(screen: Screen) -> &'static str {
     match screen {
-        Screen::Sessions => "1-4 screens  up/down select  enter open  q quit",
-        Screen::Detail => "1-4 screens  esc back  q quit",
-        _ => "1-4 screens  q quit",
+        Screen::Sessions => "1-5 screens  up/down select  enter open  q quit",
+        Screen::Detail => "1-5 screens  esc back  q quit",
+        _ => "1-5 screens  q quit",
     }
 }
 
@@ -372,6 +378,21 @@ fn breakdown_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+fn warnings_lines(app: &App) -> Vec<Line<'static>> {
+    if app.warnings.is_empty() {
+        return vec![Line::raw("No warnings recorded.")];
+    }
+    let total: u64 = app.warnings.iter().map(|w| w.count).sum();
+    let mut lines = vec![Line::raw(format!("Warnings ({total}):")), Line::raw("")];
+    for w in &app.warnings {
+        lines.push(Line::raw(format!(
+            "  [{}] x{}  {}",
+            w.kind, w.count, w.message
+        )));
+    }
+    lines
+}
+
 fn token_parts_line(label: &str, p: &store::TokenParts) -> Line<'static> {
     Line::raw(format!(
         "  {label:>9}: total {}  (in {}  out {}  cache-read {}  cache-create {})",
@@ -449,6 +470,7 @@ mod tests {
             adapters: adapters::list(),
             sessions: Vec::new(),
             breakdown: store::Breakdown::default(),
+            warnings: Vec::new(),
             screen: Screen::Overview,
             selected: 0,
             detail: None,
@@ -521,6 +543,11 @@ mod tests {
                 }],
                 files: Vec::new(),
             },
+            warnings: vec![store::WarningRow {
+                kind: "redaction".to_string(),
+                message: "file attribution unavailable".to_string(),
+                count: 1,
+            }],
             screen: Screen::Detail,
             selected: 0,
             detail: Some(detail),
@@ -583,6 +610,20 @@ mod tests {
     }
 
     #[test]
+    fn warnings_screen_groups_with_counts_and_handles_empty() {
+        let text = plain(&warnings_lines(&populated_app()));
+        assert!(text.contains("[redaction] x1"));
+        assert!(text.contains("file attribution unavailable"));
+
+        let empty = plain(&warnings_lines(&empty_app()));
+        assert!(empty.contains("No warnings recorded."));
+
+        let mut app = empty_app();
+        handle_key(&mut app, KeyCode::Char('5'));
+        assert_eq!(app.screen, Screen::Warnings);
+    }
+
+    #[test]
     fn keys_navigate_screens_list_and_back() {
         let mut app = empty_app();
         app.sessions = vec![sample_session(), sample_session()];
@@ -622,6 +663,7 @@ mod tests {
             Screen::Sessions,
             Screen::Detail,
             Screen::Breakdown,
+            Screen::Warnings,
         ] {
             let mut app = empty_app();
             app.screen = screen;

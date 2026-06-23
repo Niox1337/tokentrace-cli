@@ -754,6 +754,34 @@ pub fn breakdown(conn: &Connection) -> anyhow::Result<Breakdown> {
     })
 }
 
+/// One row on the warnings screen: a distinct kind and message, with how many
+/// times it was recorded across all sources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarningRow {
+    pub kind: String,
+    pub message: String,
+    pub count: u64,
+}
+
+/// Warnings grouped by kind and message, most frequent first. Empty on a fresh
+/// store.
+pub fn warning_breakdown(conn: &Connection) -> anyhow::Result<Vec<WarningRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT kind, message, COUNT(*) FROM warnings \
+         GROUP BY kind, message ORDER BY COUNT(*) DESC, kind, message",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(WarningRow {
+                kind: r.get(0)?,
+                message: r.get(1)?,
+                count: r.get::<_, i64>(2)? as u64,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Load the full detail for one session. Returns `None` if the id is unknown.
 pub fn session_detail(conn: &Connection, id: &str) -> anyhow::Result<Option<SessionDetail>> {
     let summary = session_summaries(conn)?.into_iter().find(|s| s.id == id);
@@ -1025,6 +1053,7 @@ mod tests {
         assert!(session_summaries(&conn).unwrap().is_empty());
         assert!(session_detail(&conn, "missing").unwrap().is_none());
         assert_eq!(breakdown(&conn).unwrap(), Breakdown::default());
+        assert!(warning_breakdown(&conn).unwrap().is_empty());
     }
 
     #[test]
@@ -1162,6 +1191,11 @@ mod tests {
         assert_eq!(bd.tools[0].name, "Edit");
         assert_eq!(bd.tools[0].calls, 1);
         assert_eq!(bd.tools[0].failures, 0);
+
+        let warns = warning_breakdown(&conn).unwrap();
+        assert_eq!(warns.len(), 1);
+        assert_eq!(warns[0].kind, "redaction");
+        assert_eq!(warns[0].count, 1);
     }
 
     #[test]
