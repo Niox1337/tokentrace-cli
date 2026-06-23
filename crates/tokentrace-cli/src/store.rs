@@ -8,7 +8,9 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
-use tokentrace_core::AgentSource;
+use tokentrace_core::{AgentSource, Confidence, ParsedData, SessionStatus, Warning, WarningKind};
+
+use crate::adapters::claude_code::turn_id;
 
 /// Bumped only when the embedded schema changes in a non-additive way.
 const SCHEMA_VERSION: i64 = 1;
@@ -221,10 +223,27 @@ pub fn insert_source(conn: &Connection, src: &AgentSource) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Register a source if it is not already present, leaving an existing row
+/// untouched. Used by `import`, which re-registers the same source on re-runs.
+pub fn ensure_source(conn: &Connection, src: &AgentSource) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO sources \
+         (id, name, source_type, adapter_id, adapter_version, imported_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            src.id,
+            src.name,
+            src.source_type.as_str(),
+            src.adapter_id,
+            src.adapter_version,
+            src.imported_at
+        ],
+    )?;
+    Ok(())
+}
+
 /// Store raw source bytes keyed by their SHA-256, deduplicating on the hash.
 /// Returns the content hash so callers can reference the preserved bytes.
-// TODO(0.4.0): called by importers; unused until the first adapter lands.
-#[allow(dead_code)]
 pub fn put_raw_source(
     conn: &Connection,
     source_id: Option<&str>,
@@ -248,6 +267,184 @@ fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
+}
+
+/// What an import wrote, for the CLI summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportCounts {
+    pub sessions: usize,
+    pub turns: usize,
+    pub requests: usize,
+    pub tools: usize,
+    pub warnings: usize,
+    /// Sum of measured token totals; estimated counts are not folded in.
+    pub measured_tokens: u64,
+}
+
+/// Persist parsed records, their warnings, and the raw source bytes in one
+/// transaction. Sessions, turns, and requests use deterministic ids so a
+/// re-import is idempotent for them.
+// TODO(0.4.0): usage, costs, and tools have no unique key, so re-importing the
+// same file double-counts them; add a replace mode when import grows one.
+pub fn import_parsed(
+    conn: &mut Connection,
+    source_id: &str,
+    raw: &[u8],
+    data: &ParsedData,
+    warnings: &[Warning],
+) -> anyhow::Result<ImportCounts> {
+    let tx = conn.transaction()?;
+    put_raw_source(&tx, Some(source_id), Some("application/json"), raw)?;
+
+    for s in &data.sessions {
+        tx.execute(
+            "INSERT OR IGNORE INTO sessions \
+             (id, source_id, external_id_hash, repo, branch, commit_before, commit_after, \
+              started_at, ended_at, status) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                s.id,
+                source_id,
+                s.external_id_hash,
+                s.repo,
+                s.branch,
+                s.commit_before,
+                s.commit_after,
+                s.started_at,
+                s.ended_at,
+                status_str(s.status),
+            ],
+        )?;
+    }
+
+    for t in &data.turns {
+        tx.execute(
+            "INSERT OR IGNORE INTO turns \
+             (id, session_id, sequence, external_id_hash, started_at, duration_ms, outcome) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                turn_id(&t.session_id, t.sequence),
+                t.session_id,
+                t.sequence,
+                t.external_id_hash,
+                t.started_at,
+                t.duration_ms,
+                t.outcome,
+            ],
+        )?;
+    }
+
+    let mut measured_tokens = 0u64;
+    for (i, r) in data.requests.iter().enumerate() {
+        let request_id = format!("{source_id}-r{i}");
+        tx.execute(
+            "INSERT OR IGNORE INTO requests \
+             (id, turn_id, model, provider, requested_at, duration_ms, success) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                request_id,
+                r.turn_id,
+                r.model,
+                r.provider,
+                r.requested_at,
+                r.duration_ms,
+                r.success,
+            ],
+        )?;
+        if let Some(u) = data.tokens.get(i) {
+            if u.confidence == Confidence::Measured {
+                measured_tokens += u.total;
+            }
+            tx.execute(
+                "INSERT INTO usage \
+                 (request_id, input, output, cache_read, cache_creation, total, confidence) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    request_id,
+                    u.input,
+                    u.output,
+                    u.cache_read,
+                    u.cache_creation,
+                    u.total,
+                    confidence_str(u.confidence),
+                ],
+            )?;
+        }
+        if let Some(c) = data.costs.get(i) {
+            tx.execute(
+                "INSERT INTO costs \
+                 (request_id, amount_minor, currency, pricing_source, confidence) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    request_id,
+                    c.amount_minor,
+                    c.currency,
+                    c.pricing_source,
+                    confidence_str(c.confidence),
+                ],
+            )?;
+        }
+    }
+
+    for t in &data.tools {
+        tx.execute(
+            "INSERT INTO tools (turn_id, name, duration_ms, success, decision, target) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                t.turn_id,
+                t.name,
+                t.duration_ms,
+                t.success,
+                t.decision,
+                t.target
+            ],
+        )?;
+    }
+
+    for w in warnings {
+        tx.execute(
+            "INSERT INTO warnings (source_id, kind, message, context) VALUES (?1, ?2, ?3, ?4)",
+            params![source_id, warning_kind_str(w.kind), w.message, w.context],
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(ImportCounts {
+        sessions: data.sessions.len(),
+        turns: data.turns.len(),
+        requests: data.requests.len(),
+        tools: data.tools.len(),
+        warnings: warnings.len(),
+        measured_tokens,
+    })
+}
+
+/// Stable storage strings for the model enums, matching their serde renames so
+/// stored rows and serialized records agree.
+fn confidence_str(c: Confidence) -> &'static str {
+    match c {
+        Confidence::Measured => "measured",
+        Confidence::Estimated => "estimated",
+        Confidence::Unknown => "unknown",
+    }
+}
+
+fn status_str(s: SessionStatus) -> &'static str {
+    match s {
+        SessionStatus::Open => "open",
+        SessionStatus::Closed => "closed",
+        SessionStatus::Unknown => "unknown",
+    }
+}
+
+fn warning_kind_str(k: WarningKind) -> &'static str {
+    match k {
+        WarningKind::MissingCorrelationKey => "missing_correlation_key",
+        WarningKind::UnsupportedField => "unsupported_field",
+        WarningKind::Redaction => "redaction",
+        WarningKind::SchemaDrift => "schema_drift",
+        WarningKind::EstimateCaveat => "estimate_caveat",
+    }
 }
 
 /// A snapshot of the store for `tokentrace doctor`.
@@ -335,6 +532,103 @@ mod tests {
         assert_eq!(rows[0].source_type, "local_file");
         // A second insert with the same id is rejected, not silently duplicated.
         assert!(insert_source(&conn, &src).is_err());
+    }
+
+    #[test]
+    fn import_persists_records_warnings_and_raw_bytes() {
+        use tokentrace_core::{
+            Confidence, CostUsage, ModelRequest, ParsedData, Session, SessionStatus, TokenUsage,
+            ToolCall, Turn, Warning, WarningKind,
+        };
+
+        let mut conn = memory_store();
+        // A source row must exist for the foreign keys to hold.
+        let src = AgentSource {
+            id: "src1".to_string(),
+            name: "logs".to_string(),
+            source_type: tokentrace_core::SourceType::LocalFile,
+            adapter_id: "claude-code".to_string(),
+            adapter_version: "0.4.0".to_string(),
+            capabilities: tokentrace_core::Capabilities::default(),
+            imported_at: Some(1),
+        };
+        insert_source(&conn, &src).unwrap();
+
+        let data = ParsedData {
+            sessions: vec![Session {
+                id: "sess".to_string(),
+                external_id_hash: "hash".to_string(),
+                repo: None,
+                branch: None,
+                commit_before: None,
+                commit_after: None,
+                started_at: Some(10),
+                ended_at: Some(20),
+                status: SessionStatus::Unknown,
+            }],
+            turns: vec![Turn {
+                session_id: "sess".to_string(),
+                sequence: 1,
+                external_id_hash: None,
+                started_at: Some(10),
+                duration_ms: None,
+                outcome: None,
+            }],
+            requests: vec![ModelRequest {
+                turn_id: turn_id("sess", 1),
+                model: "claude-sonnet-4-6".to_string(),
+                provider: "anthropic".to_string(),
+                requested_at: Some(10),
+                duration_ms: Some(500),
+                success: Some(true),
+            }],
+            tokens: vec![TokenUsage {
+                input: 100,
+                output: 20,
+                cache_read: 0,
+                cache_creation: 0,
+                total: 120,
+                confidence: Confidence::Measured,
+            }],
+            costs: vec![CostUsage {
+                amount_minor: 15,
+                currency: "USD".to_string(),
+                pricing_source: "claude-code".to_string(),
+                confidence: Confidence::Estimated,
+            }],
+            tools: vec![ToolCall {
+                turn_id: turn_id("sess", 1),
+                name: "Edit".to_string(),
+                duration_ms: Some(12),
+                success: Some(true),
+                decision: Some("user_temporary".to_string()),
+                target: None,
+            }],
+            files: Vec::new(),
+            commits: Vec::new(),
+        };
+        let warnings = vec![Warning::new(
+            WarningKind::Redaction,
+            "file attribution unavailable",
+        )];
+
+        let counts = import_parsed(&mut conn, "src1", b"{}", &data, &warnings).unwrap();
+        assert_eq!(counts.requests, 1);
+        assert_eq!(counts.tools, 1);
+        assert_eq!(counts.measured_tokens, 120);
+
+        let usage_rows: i64 = conn
+            .query_row("SELECT count(*) FROM usage", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(usage_rows, 1);
+        let warn_rows: i64 = conn
+            .query_row("SELECT count(*) FROM warnings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(warn_rows, 1);
+        let raw_rows: i64 = conn
+            .query_row("SELECT count(*) FROM raw_sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw_rows, 1);
     }
 
     #[test]
