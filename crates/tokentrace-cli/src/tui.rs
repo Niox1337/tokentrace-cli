@@ -1,10 +1,9 @@
 //! ratatui screens and navigation.
 //!
-//! A read-only viewer over the store. This slice covers the overview and the
-//! sources/adapters screens plus the event loop; the session list and detail
-//! screens follow. Measured and estimated token totals are always shown on
-//! separate lines and never merged. The screen builders stay pure so they can
-//! be unit-tested without a terminal.
+//! A read-only viewer over the store: overview, sources and adapters, session
+//! list, and session detail. Measured and estimated token totals are always
+//! shown on separate lines and never merged. The screen builders and key
+//! handler stay terminal-free so they can be unit-tested.
 
 use std::io;
 
@@ -28,15 +27,22 @@ use crate::{adapters, store};
 pub enum Screen {
     Overview,
     Sources,
+    Sessions,
+    Detail,
 }
 
 /// The loaded, read-only view of the store plus cursor state. Loaded once at
-/// launch; the viewer does not mutate the store.
+/// launch; session detail is fetched lazily when a session is opened. The
+/// viewer never mutates the store.
 pub struct App {
     pub overview: store::Overview,
     pub sources: Vec<store::SourceRow>,
     pub adapters: Vec<adapters::AdapterInfo>,
+    pub sessions: Vec<store::SessionSummary>,
     pub screen: Screen,
+    /// Cursor into `sessions` for the list and the opened detail.
+    pub selected: usize,
+    pub detail: Option<store::SessionDetail>,
     pub should_quit: bool,
 }
 
@@ -47,7 +53,10 @@ impl App {
             overview: store::overview(conn)?,
             sources: store::list_sources(conn)?,
             adapters: adapters::list(),
+            sessions: store::session_summaries(conn)?,
             screen: Screen::Overview,
+            selected: 0,
+            detail: None,
             should_quit: false,
         })
     }
@@ -61,7 +70,7 @@ pub fn run(conn: &Connection) -> anyhow::Result<()> {
     execute!(stdout, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let result = event_loop(&mut terminal, &mut app);
+    let result = event_loop(&mut terminal, &mut app, conn);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -69,26 +78,69 @@ pub fn run(conn: &Connection) -> anyhow::Result<()> {
     result
 }
 
-fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> anyhow::Result<()> {
+fn event_loop<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    conn: &Connection,
+) -> anyhow::Result<()> {
     while !app.should_quit {
         terminal.draw(|f| render(f, app))?;
         if let Event::Key(key) = event::read()? {
             if key.kind == KeyEventKind::Press {
                 handle_key(app, key.code);
+                sync_detail(app, conn)?;
             }
         }
     }
     Ok(())
 }
 
-/// Apply one keypress. Kept terminal-free so navigation is unit-testable.
+/// Apply one keypress. Navigation only, so it stays terminal-free and testable;
+/// the detail load that an Enter implies is done by [`sync_detail`].
 fn handle_key(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('1') => app.screen = Screen::Overview,
         KeyCode::Char('2') => app.screen = Screen::Sources,
+        KeyCode::Char('3') => app.screen = Screen::Sessions,
+        KeyCode::Up => {
+            if app.screen == Screen::Sessions {
+                app.selected = app.selected.saturating_sub(1);
+            }
+        }
+        KeyCode::Down => {
+            if app.screen == Screen::Sessions && !app.sessions.is_empty() {
+                app.selected = (app.selected + 1).min(app.sessions.len() - 1);
+            }
+        }
+        KeyCode::Enter => {
+            if app.screen == Screen::Sessions && !app.sessions.is_empty() {
+                app.screen = Screen::Detail;
+            }
+        }
+        KeyCode::Esc => match app.screen {
+            Screen::Detail => app.screen = Screen::Sessions,
+            _ => app.should_quit = true,
+        },
         _ => {}
     }
+}
+
+/// Load the detail for the selected session when the detail screen is open and
+/// the cached detail does not already match it.
+fn sync_detail(app: &mut App, conn: &Connection) -> anyhow::Result<()> {
+    if app.screen != Screen::Detail {
+        return Ok(());
+    }
+    let want = app.sessions.get(app.selected).map(|s| s.id.clone());
+    let have = app.detail.as_ref().map(|d| d.summary.id.clone());
+    if want != have {
+        app.detail = match want {
+            Some(id) => store::session_detail(conn, &id)?,
+            None => None,
+        };
+    }
+    Ok(())
 }
 
 /// Render the current screen: a tab bar, the screen body, and a key footer.
@@ -107,17 +159,20 @@ pub fn render(f: &mut Frame, app: &App) {
     let (title, lines) = match app.screen {
         Screen::Overview => (" Overview ", overview_lines(app)),
         Screen::Sources => (" Sources & adapters ", sources_lines(app)),
+        Screen::Sessions => (" Sessions ", sessions_lines(app)),
+        Screen::Detail => (" Session detail ", detail_lines(app)),
     };
     let body = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(body, chunks[1]);
 
-    f.render_widget(Paragraph::new(Span::raw("1/2 screens  q quit")), chunks[2]);
+    f.render_widget(Paragraph::new(Span::raw(footer(app.screen))), chunks[2]);
 }
 
 fn tab_bar(current: Screen) -> Line<'static> {
     let tabs = [
         (Screen::Overview, "1 Overview"),
         (Screen::Sources, "2 Sources"),
+        (Screen::Sessions, "3 Sessions"),
     ];
     let mut spans = vec![Span::raw("tokentrace  ")];
     for (screen, label) in tabs {
@@ -130,6 +185,14 @@ fn tab_bar(current: Screen) -> Line<'static> {
         spans.push(Span::raw(" "));
     }
     Line::from(spans)
+}
+
+fn footer(screen: Screen) -> &'static str {
+    match screen {
+        Screen::Sessions => "1/2/3 screens  up/down select  enter open  q quit",
+        Screen::Detail => "1/2/3 screens  esc back  q quit",
+        _ => "1/2/3 screens  q quit",
+    }
 }
 
 fn overview_lines(app: &App) -> Vec<Line<'static>> {
@@ -178,6 +241,83 @@ fn sources_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+fn sessions_lines(app: &App) -> Vec<Line<'static>> {
+    if app.sessions.is_empty() {
+        return vec![Line::raw("No sessions yet. Import a source to begin.")];
+    }
+    app.sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let marker = if i == app.selected { "> " } else { "  " };
+            let style = if i == app.selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            Line::styled(format!("{marker}{}", session_row(s)), style)
+        })
+        .collect()
+}
+
+fn detail_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(detail) = &app.detail else {
+        return vec![Line::raw("No session selected.")];
+    };
+    let s = &detail.summary;
+    let mut lines = vec![
+        kv("session", s.id.clone()),
+        kv("repo", s.repo.clone().unwrap_or_else(|| "-".to_string())),
+        kv(
+            "branch",
+            s.branch.clone().unwrap_or_else(|| "-".to_string()),
+        ),
+        kv(
+            "commits",
+            format!(
+                "{} -> {}",
+                detail.commit_before.as_deref().unwrap_or("-"),
+                detail.commit_after.as_deref().unwrap_or("-")
+            ),
+        ),
+        kv("turns", detail.turns.to_string()),
+        kv("measured tokens", s.measured_tokens.to_string()),
+        kv("estimated tokens", s.estimated_tokens.to_string()),
+        kv("cost", fmt_cost(s.cost_minor, &s.currency)),
+        Line::raw(""),
+        Line::raw(format!("Requests ({}):", detail.requests.len())),
+    ];
+    for r in &detail.requests {
+        lines.push(Line::raw(format!(
+            "  {} / {}  {} tokens [{}]{}",
+            r.model,
+            r.provider,
+            r.tokens,
+            r.confidence,
+            ok_suffix(r.success),
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(format!("Tools ({}):", detail.tools.len())));
+    for t in &detail.tools {
+        lines.push(Line::raw(format!(
+            "  {}{}{}",
+            t.name,
+            ok_suffix(t.success),
+            t.decision
+                .as_deref()
+                .map(|d| format!("  {d}"))
+                .unwrap_or_default(),
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(format!("Warnings ({}):", detail.warnings.len())));
+    for (kind, message) in &detail.warnings {
+        lines.push(Line::raw(format!("  [{kind}] {message}")));
+    }
+    lines
+}
+
 fn session_row(s: &store::SessionSummary) -> String {
     let repo = s.repo.as_deref().unwrap_or("(no repo)");
     let branch = s.branch.as_deref().unwrap_or("-");
@@ -201,6 +341,14 @@ fn fmt_cost(minor: i64, currency: &Option<String>) -> String {
     }
 }
 
+fn ok_suffix(success: Option<bool>) -> &'static str {
+    match success {
+        Some(true) => "  ok",
+        Some(false) => "  failed",
+        None => "",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,18 +367,8 @@ mod tests {
             .join("\n")
     }
 
-    fn empty_app() -> App {
-        App {
-            overview: store::Overview::default(),
-            sources: Vec::new(),
-            adapters: adapters::list(),
-            screen: Screen::Overview,
-            should_quit: false,
-        }
-    }
-
-    fn populated_app() -> App {
-        let s = store::SessionSummary {
+    fn sample_session() -> store::SessionSummary {
+        store::SessionSummary {
             id: "sess".to_string(),
             repo: Some("acme/widget".to_string()),
             branch: Some("main".to_string()),
@@ -240,6 +378,45 @@ mod tests {
             estimated_tokens: 40,
             cost_minor: 15,
             currency: Some("USD".to_string()),
+        }
+    }
+
+    fn empty_app() -> App {
+        App {
+            overview: store::Overview::default(),
+            sources: Vec::new(),
+            adapters: adapters::list(),
+            sessions: Vec::new(),
+            screen: Screen::Overview,
+            selected: 0,
+            detail: None,
+            should_quit: false,
+        }
+    }
+
+    fn populated_app() -> App {
+        let s = sample_session();
+        let detail = store::SessionDetail {
+            summary: s.clone(),
+            commit_before: Some("aaa".to_string()),
+            commit_after: Some("bbb".to_string()),
+            turns: 1,
+            requests: vec![store::RequestRow {
+                model: "claude-opus-4-8".to_string(),
+                provider: "anthropic".to_string(),
+                tokens: 120,
+                confidence: "measured".to_string(),
+                success: Some(true),
+            }],
+            tools: vec![store::ToolRow {
+                name: "Edit".to_string(),
+                success: Some(true),
+                decision: Some("user_temporary".to_string()),
+            }],
+            warnings: vec![(
+                "redaction".to_string(),
+                "file attribution unavailable".to_string(),
+            )],
         };
         App {
             overview: store::Overview {
@@ -248,18 +425,23 @@ mod tests {
                 warnings: 1,
                 measured_tokens: 120,
                 estimated_tokens: 40,
-                top_sessions: vec![s],
+                top_sessions: vec![s.clone()],
             },
             sources: Vec::new(),
             adapters: adapters::list(),
-            screen: Screen::Overview,
+            sessions: vec![s],
+            screen: Screen::Detail,
+            selected: 0,
+            detail: Some(detail),
             should_quit: false,
         }
     }
 
     #[test]
     fn overview_keeps_measured_and_estimated_apart() {
-        let text = plain(&overview_lines(&populated_app()));
+        let mut app = populated_app();
+        app.screen = Screen::Overview;
+        let text = plain(&overview_lines(&app));
         assert!(text.contains("measured tokens: 120"));
         assert!(text.contains("estimated tokens: 40"));
         // The two totals are never combined into a single number.
@@ -274,21 +456,54 @@ mod tests {
     }
 
     #[test]
-    fn keys_switch_screens_and_quit() {
+    fn detail_lists_requests_tools_and_warnings() {
+        let text = plain(&detail_lines(&populated_app()));
+        assert!(text.contains("claude-opus-4-8"));
+        assert!(text.contains("Tools (1)"));
+        assert!(text.contains("[redaction]"));
+        assert!(text.contains("cost: 0.15 USD"));
+    }
+
+    #[test]
+    fn keys_navigate_screens_list_and_back() {
         let mut app = empty_app();
-        handle_key(&mut app, KeyCode::Char('2'));
-        assert_eq!(app.screen, Screen::Sources);
-        handle_key(&mut app, KeyCode::Char('1'));
-        assert_eq!(app.screen, Screen::Overview);
+        app.sessions = vec![sample_session(), sample_session()];
+
+        handle_key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.screen, Screen::Sessions);
+        // Down moves the cursor and clamps at the last row.
+        handle_key(&mut app, KeyCode::Down);
+        assert_eq!(app.selected, 1);
+        handle_key(&mut app, KeyCode::Down);
+        assert_eq!(app.selected, 1);
+        // Enter opens the detail; Esc returns to the list, not quit.
+        handle_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Detail);
+        handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, Screen::Sessions);
         assert!(!app.should_quit);
-        handle_key(&mut app, KeyCode::Char('q'));
+        // Esc off the detail screen quits.
+        handle_key(&mut app, KeyCode::Esc);
         assert!(app.should_quit);
     }
 
     #[test]
-    fn both_screens_render_on_empty_and_full_store() {
+    fn enter_does_nothing_on_an_empty_session_list() {
+        let mut app = empty_app();
+        app.screen = Screen::Sessions;
+        handle_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Sessions);
+    }
+
+    #[test]
+    fn every_screen_renders_on_empty_and_full_store() {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        for screen in [Screen::Overview, Screen::Sources] {
+        for screen in [
+            Screen::Overview,
+            Screen::Sources,
+            Screen::Sessions,
+            Screen::Detail,
+        ] {
             let mut app = empty_app();
             app.screen = screen;
             terminal.draw(|f| render(f, &app)).unwrap();

@@ -473,6 +473,37 @@ pub struct Overview {
     pub top_sessions: Vec<SessionSummary>,
 }
 
+/// One model request inside a session, with its token total kept labelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestRow {
+    pub model: String,
+    pub provider: String,
+    pub tokens: u64,
+    pub confidence: String,
+    pub success: Option<bool>,
+}
+
+/// One tool call inside a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRow {
+    pub name: String,
+    pub success: Option<bool>,
+    pub decision: Option<String>,
+}
+
+/// Everything the session-detail screen shows for one session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDetail {
+    pub summary: SessionSummary,
+    pub commit_before: Option<String>,
+    pub commit_after: Option<String>,
+    pub turns: usize,
+    pub requests: Vec<RequestRow>,
+    pub tools: Vec<ToolRow>,
+    /// Source-level warnings; warnings are recorded per source, not per session.
+    pub warnings: Vec<(String, String)>,
+}
+
 /// Per-session token sums split by confidence, keyed by session id.
 fn token_totals_by_session(
     conn: &Connection,
@@ -585,6 +616,85 @@ pub fn overview(conn: &Connection) -> anyhow::Result<Overview> {
         estimated_tokens,
         top_sessions,
     })
+}
+
+/// Load the full detail for one session. Returns `None` if the id is unknown.
+pub fn session_detail(conn: &Connection, id: &str) -> anyhow::Result<Option<SessionDetail>> {
+    let summary = session_summaries(conn)?.into_iter().find(|s| s.id == id);
+    let Some(summary) = summary else {
+        return Ok(None);
+    };
+
+    let (commit_before, commit_after, source_id): (Option<String>, Option<String>, Option<String>) =
+        conn.query_row(
+            "SELECT commit_before, commit_after, source_id FROM sessions WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+
+    let turns: i64 = conn.query_row(
+        "SELECT count(*) FROM turns WHERE session_id = ?1",
+        [id],
+        |r| r.get(0),
+    )?;
+
+    let mut req_stmt = conn.prepare(
+        "SELECT r.model, r.provider, r.success, \
+                COALESCE(u.total, 0), COALESCE(u.confidence, 'unknown') \
+         FROM requests r \
+         JOIN turns t ON t.id = r.turn_id \
+         LEFT JOIN usage u ON u.request_id = r.id \
+         WHERE t.session_id = ?1 \
+         ORDER BY r.requested_at",
+    )?;
+    let requests = req_stmt
+        .query_map([id], |r| {
+            Ok(RequestRow {
+                model: r.get(0)?,
+                provider: r.get(1)?,
+                success: r.get(2)?,
+                tokens: r.get::<_, i64>(3)? as u64,
+                confidence: r.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut tool_stmt = conn.prepare(
+        "SELECT tl.name, tl.success, tl.decision \
+         FROM tools tl JOIN turns t ON t.id = tl.turn_id \
+         WHERE t.session_id = ?1 ORDER BY tl.id",
+    )?;
+    let tools = tool_stmt
+        .query_map([id], |r| {
+            Ok(ToolRow {
+                name: r.get(0)?,
+                success: r.get(1)?,
+                decision: r.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let warnings = match &source_id {
+        Some(sid) => {
+            let mut w_stmt = conn
+                .prepare("SELECT kind, message FROM warnings WHERE source_id = ?1 ORDER BY id")?;
+            let rows = w_stmt
+                .query_map([sid], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        }
+        None => Vec::new(),
+    };
+
+    Ok(Some(SessionDetail {
+        summary,
+        commit_before,
+        commit_after,
+        turns: turns as usize,
+        requests,
+        tools,
+        warnings,
+    }))
 }
 
 /// A snapshot of the store for `tokentrace doctor`.
@@ -777,6 +887,7 @@ mod tests {
         let ov = overview(&conn).unwrap();
         assert_eq!(ov, Overview::default());
         assert!(session_summaries(&conn).unwrap().is_empty());
+        assert!(session_detail(&conn, "missing").unwrap().is_none());
     }
 
     #[test]
@@ -891,6 +1002,15 @@ mod tests {
         assert_eq!(summary.measured_tokens, 120);
         assert_eq!(summary.estimated_tokens, 40);
         assert_eq!(summary.cost_minor, 15);
+
+        let detail = session_detail(&conn, "sess").unwrap().unwrap();
+        assert_eq!(detail.summary.measured_tokens, 120);
+        assert_eq!(detail.summary.estimated_tokens, 40);
+        assert_eq!(detail.commit_after.as_deref(), Some("bbb"));
+        assert_eq!(detail.turns, 1);
+        assert_eq!(detail.requests.len(), 2);
+        assert_eq!(detail.tools.len(), 1);
+        assert_eq!(detail.warnings.len(), 1);
     }
 
     #[test]
