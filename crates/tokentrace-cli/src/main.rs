@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use tokentrace_core::{AgentSource, SourceType};
+use tokentrace_core::{AgentSource, PrivacyLevel, SourceType};
 
 mod adapters;
 mod git;
@@ -34,6 +34,9 @@ enum Command {
         /// Human-readable name for the source (defaults to the file name).
         #[arg(long)]
         name: Option<String>,
+        /// Opt in to importing a source whose adapter can expose sensitive content.
+        #[arg(long)]
+        allow_sensitive: bool,
     },
     /// Inspect imported sources.
     Sources {
@@ -47,6 +50,12 @@ enum Command {
     },
     /// Browse the store in the terminal UI.
     Tui,
+    /// Export the store as newline-delimited JSON, one object per session.
+    Export {
+        /// File to write to; writes to stdout when omitted.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Summarize the current git repo and attribute a cost across a commit range.
     Git {
         /// Start revision of the range (exclusive), e.g. a session's commit-before.
@@ -96,7 +105,8 @@ fn main() -> anyhow::Result<()> {
             adapter,
             path,
             name,
-        } => import(adapter, path, name)?,
+            allow_sensitive,
+        } => import(adapter, path, name, allow_sensitive)?,
         Command::Sources {
             command: SourcesCommand::List,
         } => sources_list()?,
@@ -115,6 +125,7 @@ fn main() -> anyhow::Result<()> {
             let conn = store::open(&store::default_store_path())?;
             tui::run(&conn)?;
         }
+        Command::Export { out } => export(out)?,
         Command::Git {
             from,
             to,
@@ -197,6 +208,21 @@ fn git_summary(
     Ok(())
 }
 
+fn export(out: Option<PathBuf>) -> anyhow::Result<()> {
+    let conn = store::open(&store::default_store_path())?;
+    match out {
+        Some(path) => {
+            let mut f = std::fs::File::create(&path)?;
+            let n = store::export_jsonl(&conn, &mut f)?;
+            println!("Exported {n} sessions to {}", path.display());
+        }
+        None => {
+            store::export_jsonl(&conn, &mut std::io::stdout().lock())?;
+        }
+    }
+    Ok(())
+}
+
 fn sources_list() -> anyhow::Result<()> {
     let conn = store::open(&store::default_store_path())?;
     let sources = store::list_sources(&conn)?;
@@ -249,10 +275,22 @@ fn sources_add(adapter: String, name: String, path: PathBuf) -> anyhow::Result<(
     Ok(())
 }
 
-fn import(adapter: String, path: PathBuf, name: Option<String>) -> anyhow::Result<()> {
+fn import(
+    adapter: String,
+    path: PathBuf,
+    name: Option<String>,
+    allow_sensitive: bool,
+) -> anyhow::Result<()> {
     let info = adapters::find(&adapter).ok_or_else(|| {
         anyhow::anyhow!("unknown adapter '{adapter}'; see `tokentrace adapters list`")
     })?;
+    // Importing sensitive content stays opt-in and is labelled when it happens.
+    let sensitive = info.capabilities.privacy_level == PrivacyLevel::Sensitive;
+    if sensitive && !allow_sensitive {
+        anyhow::bail!(
+            "adapter '{adapter}' can expose sensitive content; re-run with --allow-sensitive to opt in"
+        );
+    }
     let runner = adapters::build(&adapter)
         .ok_or_else(|| anyhow::anyhow!("adapter '{adapter}' cannot import yet"))?;
 
@@ -284,7 +322,8 @@ fn import(adapter: String, path: PathBuf, name: Option<String>) -> anyhow::Resul
     store::ensure_source(&conn, &source)?;
     let counts = store::import_parsed(&mut conn, &source.id, &raw, &data, &warnings)?;
 
-    println!("Imported '{}' ({})", source.name, source.id);
+    let label = if sensitive { "  [sensitive]" } else { "" };
+    println!("Imported '{}' ({}){}", source.name, source.id, label);
     println!(
         "  sessions: {}  turns: {}  requests: {}  tools: {}",
         counts.sessions, counts.turns, counts.requests, counts.tools
