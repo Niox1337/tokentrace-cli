@@ -23,6 +23,18 @@ struct Cli {
 enum Command {
     /// Report environment and store status.
     Doctor,
+    /// Import a source file through an adapter into the store.
+    Import {
+        /// Adapter id, e.g. claude-code.
+        #[arg(long)]
+        adapter: String,
+        /// Path to the source export to import.
+        #[arg(long)]
+        path: PathBuf,
+        /// Human-readable name for the source (defaults to the file name).
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Inspect imported sources.
     Sources {
         #[command(subcommand)]
@@ -63,6 +75,11 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Doctor => doctor(),
+        Command::Import {
+            adapter,
+            path,
+            name,
+        } => import(adapter, path, name)?,
         Command::Sources {
             command: SourcesCommand::List,
         } => sources_list()?,
@@ -130,6 +147,56 @@ fn sources_add(adapter: String, name: String, path: PathBuf) -> anyhow::Result<(
         "  capabilities: {}",
         adapters::caps_summary(&source.capabilities)
     );
+    Ok(())
+}
+
+fn import(adapter: String, path: PathBuf, name: Option<String>) -> anyhow::Result<()> {
+    let info = adapters::find(&adapter).ok_or_else(|| {
+        anyhow::anyhow!("unknown adapter '{adapter}'; see `tokentrace adapters list`")
+    })?;
+    let runner = adapters::build(&adapter)
+        .ok_or_else(|| anyhow::anyhow!("adapter '{adapter}' cannot import yet"))?;
+
+    let raw =
+        std::fs::read(&path).map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+    let data = runner.parse(&raw)?;
+    let warnings = runner.validate(&data);
+
+    let name = name.unwrap_or_else(|| {
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| adapter.clone())
+    });
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64);
+    let source = AgentSource {
+        id: source_id(&adapter, &name, &path),
+        name,
+        source_type: SourceType::LocalFile,
+        adapter_id: adapter,
+        adapter_version: info.version.to_string(),
+        capabilities: info.capabilities,
+        imported_at: now,
+    };
+
+    let mut conn = store::open(&store::default_store_path())?;
+    store::ensure_source(&conn, &source)?;
+    let counts = store::import_parsed(&mut conn, &source.id, &raw, &data, &warnings)?;
+
+    println!("Imported '{}' ({})", source.name, source.id);
+    println!(
+        "  sessions: {}  turns: {}  requests: {}  tools: {}",
+        counts.sessions, counts.turns, counts.requests, counts.tools
+    );
+    println!("  measured tokens: {}", counts.measured_tokens);
+    if counts.warnings > 0 {
+        println!("  warnings: {}", counts.warnings);
+        for w in &warnings {
+            println!("    [{:?}] {}", w.kind, w.message);
+        }
+    }
     Ok(())
 }
 

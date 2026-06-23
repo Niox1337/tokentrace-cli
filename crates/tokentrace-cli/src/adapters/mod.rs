@@ -8,7 +8,7 @@
 
 pub mod claude_code;
 
-use tokentrace_core::Capabilities;
+use tokentrace_core::{Adapter, Capabilities};
 
 /// A bundled adapter, as shown by `tokentrace adapters list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +37,14 @@ pub fn list() -> Vec<AdapterInfo> {
 /// Look up a bundled adapter by id.
 pub fn find(id: &str) -> Option<AdapterInfo> {
     list().into_iter().find(|a| a.id == id)
+}
+
+/// Construct the runnable adapter for `id`, for the import path.
+pub fn build(id: &str) -> Option<Box<dyn Adapter>> {
+    match id {
+        claude_code::ID => Some(Box::new(claude_code::ClaudeCode)),
+        _ => None,
+    }
 }
 
 /// A one-line summary of an adapter's capabilities for CLI output.

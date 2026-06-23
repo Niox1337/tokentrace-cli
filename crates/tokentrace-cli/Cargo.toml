@@ -14,4 +14,5 @@ tokentrace-core = { workspace = true }
 clap = { workspace = true }
 rusqlite = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
