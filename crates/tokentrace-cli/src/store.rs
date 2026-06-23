@@ -447,6 +447,146 @@ fn warning_kind_str(k: WarningKind) -> &'static str {
     }
 }
 
+/// Per-session totals for the TUI lists. Measured and estimated token sums are
+/// kept in separate fields and never merged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub id: String,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub started_at: Option<i64>,
+    pub status: String,
+    pub measured_tokens: u64,
+    pub estimated_tokens: u64,
+    pub cost_minor: i64,
+    pub currency: Option<String>,
+}
+
+/// Store-wide totals and the most expensive sessions, for the overview screen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Overview {
+    pub sources: usize,
+    pub sessions: usize,
+    pub warnings: usize,
+    pub measured_tokens: u64,
+    pub estimated_tokens: u64,
+    pub top_sessions: Vec<SessionSummary>,
+}
+
+/// Per-session token sums split by confidence, keyed by session id.
+fn token_totals_by_session(
+    conn: &Connection,
+) -> anyhow::Result<std::collections::HashMap<String, (u64, u64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.session_id, u.confidence, SUM(u.total) \
+         FROM usage u \
+         JOIN requests r ON r.id = u.request_id \
+         JOIN turns t ON t.id = r.turn_id \
+         GROUP BY t.session_id, u.confidence",
+    )?;
+    let mut map: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)? as u64,
+        ))
+    })?;
+    for row in rows {
+        let (session, conf, total) = row?;
+        let entry = map.entry(session).or_default();
+        if conf == "measured" {
+            entry.0 += total;
+        } else if conf == "estimated" {
+            entry.1 += total;
+        }
+    }
+    Ok(map)
+}
+
+/// Per-session cost sum and currency, keyed by session id.
+fn cost_totals_by_session(
+    conn: &Connection,
+) -> anyhow::Result<std::collections::HashMap<String, (i64, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.session_id, SUM(c.amount_minor), MAX(c.currency) \
+         FROM costs c \
+         JOIN requests r ON r.id = c.request_id \
+         JOIN turns t ON t.id = r.turn_id \
+         GROUP BY t.session_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let (session, amount, currency) = row?;
+        map.insert(session, (amount, currency));
+    }
+    Ok(map)
+}
+
+/// Summarize every session, sorted by total tokens (measured + estimated) then
+/// most recent first. Returns an empty vec on a fresh store.
+pub fn session_summaries(conn: &Connection) -> anyhow::Result<Vec<SessionSummary>> {
+    let tokens = token_totals_by_session(conn)?;
+    let costs = cost_totals_by_session(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, repo, branch, started_at, status FROM sessions ORDER BY started_at DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(SessionSummary {
+            id: r.get(0)?,
+            repo: r.get(1)?,
+            branch: r.get(2)?,
+            started_at: r.get(3)?,
+            status: r.get(4)?,
+            ..Default::default()
+        })
+    })?;
+    let mut out: Vec<SessionSummary> = Vec::new();
+    for row in rows {
+        let mut s = row?;
+        if let Some((m, e)) = tokens.get(&s.id) {
+            s.measured_tokens = *m;
+            s.estimated_tokens = *e;
+        }
+        if let Some((amount, currency)) = costs.get(&s.id) {
+            s.cost_minor = *amount;
+            s.currency = currency.clone();
+        }
+        out.push(s);
+    }
+    out.sort_by(|a, b| {
+        (b.measured_tokens + b.estimated_tokens)
+            .cmp(&(a.measured_tokens + a.estimated_tokens))
+            .then(b.started_at.cmp(&a.started_at))
+    });
+    Ok(out)
+}
+
+/// Build the overview totals, including the five most expensive sessions.
+pub fn overview(conn: &Connection) -> anyhow::Result<Overview> {
+    let sources: i64 = conn.query_row("SELECT count(*) FROM sources", [], |r| r.get(0))?;
+    let warnings: i64 = conn.query_row("SELECT count(*) FROM warnings", [], |r| r.get(0))?;
+    let summaries = session_summaries(conn)?;
+    let measured_tokens = summaries.iter().map(|s| s.measured_tokens).sum();
+    let estimated_tokens = summaries.iter().map(|s| s.estimated_tokens).sum();
+    let top_sessions = summaries.iter().take(5).cloned().collect();
+    Ok(Overview {
+        sources: sources as usize,
+        sessions: summaries.len(),
+        warnings: warnings as usize,
+        measured_tokens,
+        estimated_tokens,
+        top_sessions,
+    })
+}
+
 /// A snapshot of the store for `tokentrace doctor`.
 #[derive(Debug, Clone)]
 pub struct StoreStatus {
@@ -629,6 +769,128 @@ mod tests {
             .query_row("SELECT count(*) FROM raw_sources", [], |r| r.get(0))
             .unwrap();
         assert_eq!(raw_rows, 1);
+    }
+
+    #[test]
+    fn empty_store_overview_and_summaries_are_clean() {
+        let conn = memory_store();
+        let ov = overview(&conn).unwrap();
+        assert_eq!(ov, Overview::default());
+        assert!(session_summaries(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn overview_splits_measured_and_estimated_tokens() {
+        use tokentrace_core::{
+            Confidence, CostUsage, ModelRequest, ParsedData, Session, SessionStatus, TokenUsage,
+            ToolCall, Turn, Warning, WarningKind,
+        };
+
+        let mut conn = memory_store();
+        let src = AgentSource {
+            id: "src1".to_string(),
+            name: "logs".to_string(),
+            source_type: tokentrace_core::SourceType::LocalFile,
+            adapter_id: "claude-code".to_string(),
+            adapter_version: "0.6.0".to_string(),
+            capabilities: tokentrace_core::Capabilities::default(),
+            imported_at: Some(1),
+        };
+        insert_source(&conn, &src).unwrap();
+
+        let data = ParsedData {
+            sessions: vec![Session {
+                id: "sess".to_string(),
+                external_id_hash: "hash".to_string(),
+                repo: Some("acme/widget".to_string()),
+                branch: Some("main".to_string()),
+                commit_before: Some("aaa".to_string()),
+                commit_after: Some("bbb".to_string()),
+                started_at: Some(10),
+                ended_at: Some(20),
+                status: SessionStatus::Closed,
+            }],
+            turns: vec![Turn {
+                session_id: "sess".to_string(),
+                sequence: 1,
+                external_id_hash: None,
+                started_at: Some(10),
+                duration_ms: None,
+                outcome: None,
+            }],
+            requests: vec![
+                ModelRequest {
+                    turn_id: turn_id("sess", 1),
+                    model: "claude-opus-4-8".to_string(),
+                    provider: "anthropic".to_string(),
+                    requested_at: Some(10),
+                    duration_ms: Some(500),
+                    success: Some(true),
+                },
+                ModelRequest {
+                    turn_id: turn_id("sess", 1),
+                    model: "claude-haiku-4-5".to_string(),
+                    provider: "anthropic".to_string(),
+                    requested_at: Some(11),
+                    duration_ms: Some(200),
+                    success: Some(true),
+                },
+            ],
+            tokens: vec![
+                TokenUsage {
+                    input: 100,
+                    output: 20,
+                    cache_read: 0,
+                    cache_creation: 0,
+                    total: 120,
+                    confidence: Confidence::Measured,
+                },
+                TokenUsage {
+                    input: 30,
+                    output: 10,
+                    cache_read: 0,
+                    cache_creation: 0,
+                    total: 40,
+                    confidence: Confidence::Estimated,
+                },
+            ],
+            costs: vec![CostUsage {
+                amount_minor: 15,
+                currency: "USD".to_string(),
+                pricing_source: "claude-code".to_string(),
+                confidence: Confidence::Estimated,
+            }],
+            tools: vec![ToolCall {
+                turn_id: turn_id("sess", 1),
+                name: "Edit".to_string(),
+                duration_ms: Some(12),
+                success: Some(true),
+                decision: Some("user_temporary".to_string()),
+                target: None,
+            }],
+            files: Vec::new(),
+            commits: Vec::new(),
+        };
+        let warnings = vec![Warning::new(
+            WarningKind::Redaction,
+            "file attribution unavailable",
+        )];
+        import_parsed(&mut conn, "src1", b"{}", &data, &warnings).unwrap();
+
+        let ov = overview(&conn).unwrap();
+        assert_eq!(ov.sources, 1);
+        assert_eq!(ov.sessions, 1);
+        assert_eq!(ov.warnings, 1);
+        // Measured and estimated stay apart, never folded into one total.
+        assert_eq!(ov.measured_tokens, 120);
+        assert_eq!(ov.estimated_tokens, 40);
+        assert_eq!(ov.top_sessions.len(), 1);
+
+        let summary = &ov.top_sessions[0];
+        assert_eq!(summary.repo.as_deref(), Some("acme/widget"));
+        assert_eq!(summary.measured_tokens, 120);
+        assert_eq!(summary.estimated_tokens, 40);
+        assert_eq!(summary.cost_minor, 15);
     }
 
     #[test]
