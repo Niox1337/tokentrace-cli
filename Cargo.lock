@@ -423,6 +423,7 @@ dependencies = [
  "anyhow",
  "clap",
  "rusqlite",
+ "serde_json",
  "sha2",
  "tokentrace-core",
 ]
