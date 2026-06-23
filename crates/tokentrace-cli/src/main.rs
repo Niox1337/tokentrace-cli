@@ -45,6 +45,8 @@ enum Command {
         #[command(subcommand)]
         command: AdaptersCommand,
     },
+    /// Browse the store in the terminal UI.
+    Tui,
     /// Summarize the current git repo and attribute a cost across a commit range.
     Git {
         /// Start revision of the range (exclusive), e.g. a session's commit-before.
@@ -109,6 +111,10 @@ fn main() -> anyhow::Result<()> {
         Command::Adapters {
             command: AdaptersCommand::List,
         } => adapters_list(),
+        Command::Tui => {
+            let conn = store::open(&store::default_store_path())?;
+            tui::run(&conn)?;
+        }
         Command::Git {
             from,
             to,
