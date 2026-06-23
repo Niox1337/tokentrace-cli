@@ -6,8 +6,6 @@
 //! adapter's declared capabilities, so the CLI can list them and validate
 //! `sources add`.
 
-// The parser and adapter are reached by `tokentrace import`, wired later in 0.4.0.
-#[allow(dead_code)]
 pub mod claude_code;
 
 use tokentrace_core::{Adapter, Capabilities};
@@ -42,8 +40,6 @@ pub fn find(id: &str) -> Option<AdapterInfo> {
 }
 
 /// Construct the runnable adapter for `id`, for the import path.
-// TODO(0.4.0): called by `tokentrace import`; unused until that command lands.
-#[allow(dead_code)]
 pub fn build(id: &str) -> Option<Box<dyn Adapter>> {
     match id {
         claude_code::ID => Some(Box::new(claude_code::ClaudeCode)),
