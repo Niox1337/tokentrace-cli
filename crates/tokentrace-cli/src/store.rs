@@ -861,6 +861,29 @@ pub fn session_detail(conn: &Connection, id: &str) -> anyhow::Result<Option<Sess
     }))
 }
 
+/// Write one JSON object per session to `out`, newline-delimited (JSONL).
+/// Measured and estimated token totals stay in separate fields. Returns the
+/// number of rows written; zero on a fresh store.
+// ponytail: session-grained export; add a per-request stream when an importer needs the detail.
+pub fn export_jsonl(conn: &Connection, out: &mut impl std::io::Write) -> anyhow::Result<usize> {
+    let sessions = session_summaries(conn)?;
+    for s in &sessions {
+        let line = serde_json::json!({
+            "session_id": s.id,
+            "repo": s.repo,
+            "branch": s.branch,
+            "started_at": s.started_at,
+            "status": s.status,
+            "measured_tokens": s.measured_tokens,
+            "estimated_tokens": s.estimated_tokens,
+            "cost_minor": s.cost_minor,
+            "currency": s.currency,
+        });
+        writeln!(out, "{line}")?;
+    }
+    Ok(sessions.len())
+}
+
 /// A snapshot of the store for `tokentrace doctor`.
 #[derive(Debug, Clone)]
 pub struct StoreStatus {
@@ -1054,6 +1077,55 @@ mod tests {
         assert!(session_detail(&conn, "missing").unwrap().is_none());
         assert_eq!(breakdown(&conn).unwrap(), Breakdown::default());
         assert!(warning_breakdown(&conn).unwrap().is_empty());
+        let mut buf = Vec::new();
+        assert_eq!(export_jsonl(&conn, &mut buf).unwrap(), 0);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn export_writes_one_jsonl_line_per_session() {
+        use tokentrace_core::{ParsedData, Session, SessionStatus};
+
+        let mut conn = memory_store();
+        let src = AgentSource {
+            id: "src1".to_string(),
+            name: "logs".to_string(),
+            source_type: tokentrace_core::SourceType::LocalFile,
+            adapter_id: "claude-code".to_string(),
+            adapter_version: "0.8.0".to_string(),
+            capabilities: tokentrace_core::Capabilities::default(),
+            imported_at: Some(1),
+        };
+        insert_source(&conn, &src).unwrap();
+        let data = ParsedData {
+            sessions: vec![Session {
+                id: "sess".to_string(),
+                external_id_hash: "h".to_string(),
+                repo: Some("acme".to_string()),
+                branch: None,
+                commit_before: None,
+                commit_after: None,
+                started_at: Some(5),
+                ended_at: Some(6),
+                status: SessionStatus::Closed,
+            }],
+            turns: Vec::new(),
+            requests: Vec::new(),
+            tokens: Vec::new(),
+            costs: Vec::new(),
+            tools: Vec::new(),
+            files: Vec::new(),
+            commits: Vec::new(),
+        };
+        import_parsed(&mut conn, "src1", b"{}", &data, &[]).unwrap();
+
+        let mut buf = Vec::new();
+        assert_eq!(export_jsonl(&conn, &mut buf).unwrap(), 1);
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(v["session_id"], "sess");
+        assert_eq!(v["repo"], "acme");
     }
 
     #[test]

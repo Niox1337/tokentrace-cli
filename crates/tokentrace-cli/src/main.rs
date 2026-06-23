@@ -50,6 +50,12 @@ enum Command {
     },
     /// Browse the store in the terminal UI.
     Tui,
+    /// Export the store as newline-delimited JSON, one object per session.
+    Export {
+        /// File to write to; writes to stdout when omitted.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Summarize the current git repo and attribute a cost across a commit range.
     Git {
         /// Start revision of the range (exclusive), e.g. a session's commit-before.
@@ -119,6 +125,7 @@ fn main() -> anyhow::Result<()> {
             let conn = store::open(&store::default_store_path())?;
             tui::run(&conn)?;
         }
+        Command::Export { out } => export(out)?,
         Command::Git {
             from,
             to,
@@ -196,6 +203,21 @@ fn git_summary(
                 usage.amount_minor, usage.currency
             );
             println!("        warning: {}", w.message);
+        }
+    }
+    Ok(())
+}
+
+fn export(out: Option<PathBuf>) -> anyhow::Result<()> {
+    let conn = store::open(&store::default_store_path())?;
+    match out {
+        Some(path) => {
+            let mut f = std::fs::File::create(&path)?;
+            let n = store::export_jsonl(&conn, &mut f)?;
+            println!("Exported {n} sessions to {}", path.display());
+        }
+        None => {
+            store::export_jsonl(&conn, &mut std::io::stdout().lock())?;
         }
     }
     Ok(())
