@@ -5,6 +5,7 @@ use tokentrace_core::{AgentSource, PrivacyLevel, SourceType};
 
 mod adapters;
 mod git;
+mod provider;
 mod store;
 mod tui;
 

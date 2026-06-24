@@ -754,6 +754,120 @@ pub fn breakdown(conn: &Connection) -> anyhow::Result<Breakdown> {
     })
 }
 
+/// Token totals for one provider, split into the measured and estimated bands.
+/// The two bands are kept apart and never summed into one figure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderTokens {
+    pub provider: String,
+    pub measured: u64,
+    pub estimated: u64,
+}
+
+/// Cost rolled up to one provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCost {
+    pub provider: String,
+    pub amount_minor: i64,
+    pub currency: Option<String>,
+}
+
+/// Per-provider token and cost totals for the usage bar. Empty on a fresh store.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderUsage {
+    pub tokens: Vec<ProviderTokens>,
+    pub cost: Vec<ProviderCost>,
+}
+
+/// Aggregate tokens and cost by provider for the stacked usage bar. The measured
+/// and estimated token bands stay apart. A request with an empty provider string
+/// has one derived from its model name. Both lists are sorted largest first.
+pub fn provider_usage(conn: &Connection) -> anyhow::Result<ProviderUsage> {
+    use crate::provider::{canonical, provider_from_model};
+    use std::collections::HashMap;
+
+    // Resolve a request's provider, deriving one from the model when absent.
+    let resolve = |provider: &str, model: &str| -> String {
+        if provider.trim().is_empty() {
+            provider_from_model(model).to_string()
+        } else {
+            canonical(provider)
+        }
+    };
+
+    let mut tok_stmt = conn.prepare(
+        "SELECT r.provider, r.model, u.confidence, SUM(u.total) \
+         FROM usage u JOIN requests r ON r.id = u.request_id \
+         GROUP BY r.provider, r.model, u.confidence",
+    )?;
+    let mut tokens: HashMap<String, ProviderTokens> = HashMap::new();
+    let tok_rows = tok_stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)? as u64,
+        ))
+    })?;
+    for row in tok_rows {
+        let (provider, model, conf, total) = row?;
+        let key = resolve(&provider, &model);
+        let entry = tokens.entry(key.clone()).or_insert_with(|| ProviderTokens {
+            provider: key,
+            ..Default::default()
+        });
+        match conf.as_str() {
+            "measured" => entry.measured += total,
+            "estimated" => entry.estimated += total,
+            _ => {}
+        }
+    }
+
+    let mut cost_stmt = conn.prepare(
+        "SELECT r.provider, r.model, SUM(c.amount_minor), MAX(c.currency) \
+         FROM costs c JOIN requests r ON r.id = c.request_id \
+         GROUP BY r.provider, r.model",
+    )?;
+    let mut cost: HashMap<String, ProviderCost> = HashMap::new();
+    let cost_rows = cost_stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    for row in cost_rows {
+        let (provider, model, amount, currency) = row?;
+        let key = resolve(&provider, &model);
+        let entry = cost.entry(key.clone()).or_insert_with(|| ProviderCost {
+            provider: key,
+            amount_minor: 0,
+            currency: None,
+        });
+        entry.amount_minor += amount;
+        if entry.currency.is_none() {
+            entry.currency = currency;
+        }
+    }
+
+    let mut tokens: Vec<ProviderTokens> = tokens.into_values().collect();
+    // Rank providers by their combined volume so the largest segment leads; the
+    // bands are added here only to order the bar, never to display one figure.
+    tokens.sort_by(|a, b| {
+        (b.measured + b.estimated)
+            .cmp(&(a.measured + a.estimated))
+            .then_with(|| a.provider.cmp(&b.provider))
+    });
+    let mut cost: Vec<ProviderCost> = cost.into_values().collect();
+    cost.sort_by(|a, b| {
+        b.amount_minor
+            .cmp(&a.amount_minor)
+            .then_with(|| a.provider.cmp(&b.provider))
+    });
+
+    Ok(ProviderUsage { tokens, cost })
+}
+
 /// One row on the warnings screen: a distinct kind and message, with how many
 /// times it was recorded across all sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1281,5 +1395,127 @@ mod tests {
             .query_row("SELECT count(*) FROM raw_sources", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn provider_usage_groups_by_provider_and_derives_from_model() {
+        use tokentrace_core::{
+            Confidence, CostUsage, ModelRequest, ParsedData, Session, SessionStatus, TokenUsage,
+            Turn,
+        };
+
+        let mut conn = memory_store();
+        let src = AgentSource {
+            id: "src1".to_string(),
+            name: "logs".to_string(),
+            source_type: tokentrace_core::SourceType::LocalFile,
+            adapter_id: "claude-code".to_string(),
+            adapter_version: "0.11.0".to_string(),
+            capabilities: tokentrace_core::Capabilities::default(),
+            imported_at: Some(1),
+        };
+        insert_source(&conn, &src).unwrap();
+
+        let data = ParsedData {
+            sessions: vec![Session {
+                id: "sess".to_string(),
+                external_id_hash: "hash".to_string(),
+                repo: None,
+                branch: None,
+                commit_before: None,
+                commit_after: None,
+                started_at: Some(10),
+                ended_at: Some(20),
+                status: SessionStatus::Closed,
+            }],
+            turns: vec![Turn {
+                session_id: "sess".to_string(),
+                sequence: 1,
+                external_id_hash: None,
+                started_at: Some(10),
+                duration_ms: None,
+                outcome: None,
+            }],
+            requests: vec![
+                ModelRequest {
+                    turn_id: turn_id("sess", 1),
+                    model: "claude-opus-4-8".to_string(),
+                    provider: "anthropic".to_string(),
+                    requested_at: Some(10),
+                    duration_ms: None,
+                    success: Some(true),
+                },
+                ModelRequest {
+                    turn_id: turn_id("sess", 1),
+                    model: "gpt-4o-mini".to_string(),
+                    // No provider string; it must be derived from the model name.
+                    provider: String::new(),
+                    requested_at: Some(11),
+                    duration_ms: None,
+                    success: Some(true),
+                },
+            ],
+            tokens: vec![
+                TokenUsage {
+                    input: 100,
+                    output: 20,
+                    cache_read: 0,
+                    cache_creation: 0,
+                    total: 120,
+                    confidence: Confidence::Measured,
+                },
+                TokenUsage {
+                    input: 30,
+                    output: 10,
+                    cache_read: 0,
+                    cache_creation: 0,
+                    total: 40,
+                    confidence: Confidence::Estimated,
+                },
+            ],
+            costs: vec![
+                CostUsage {
+                    amount_minor: 15,
+                    currency: "USD".to_string(),
+                    pricing_source: "test".to_string(),
+                    confidence: Confidence::Estimated,
+                },
+                CostUsage {
+                    amount_minor: 9,
+                    currency: "USD".to_string(),
+                    pricing_source: "test".to_string(),
+                    confidence: Confidence::Estimated,
+                },
+            ],
+            tools: Vec::new(),
+            files: Vec::new(),
+            commits: Vec::new(),
+        };
+        import_parsed(&mut conn, "src1", b"{}", &data, &[]).unwrap();
+
+        let usage = provider_usage(&conn).unwrap();
+        // Two providers: anthropic from the label, openai derived from gpt-.
+        assert_eq!(usage.tokens.len(), 2);
+        // The larger combined volume leads, so anthropic sorts first.
+        assert_eq!(usage.tokens[0].provider, "anthropic");
+        assert_eq!(usage.tokens[0].measured, 120);
+        assert_eq!(usage.tokens[0].estimated, 0);
+        let openai = usage
+            .tokens
+            .iter()
+            .find(|t| t.provider == "openai")
+            .unwrap();
+        // The empty-provider request landed under openai, in the estimated band.
+        assert_eq!(openai.measured, 0);
+        assert_eq!(openai.estimated, 40);
+
+        let an_cost = usage
+            .cost
+            .iter()
+            .find(|c| c.provider == "anthropic")
+            .unwrap();
+        assert_eq!(an_cost.amount_minor, 15);
+        let oa_cost = usage.cost.iter().find(|c| c.provider == "openai").unwrap();
+        assert_eq!(oa_cost.amount_minor, 9);
     }
 }

@@ -14,13 +14,13 @@ use crossterm::terminal::{
 };
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 use rusqlite::Connection;
 
-use crate::{adapters, store};
+use crate::{adapters, provider, store};
 
 /// Which top-level screen the viewer is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,11 +53,15 @@ pub struct App {
     pub sessions: Vec<store::SessionSummary>,
     pub breakdown: store::Breakdown,
     pub warnings: Vec<store::WarningRow>,
+    /// Per-provider totals behind the stacked usage bar.
+    pub usage: store::ProviderUsage,
     pub screen: Screen,
     /// Cursor into `sessions` for the list and the opened detail.
     pub selected: usize,
     pub detail: Option<store::SessionDetail>,
     pub should_quit: bool,
+    /// Whether to paint the usage bar in colour. Off honours `NO_COLOR`.
+    pub use_color: bool,
 }
 
 impl App {
@@ -70,10 +74,12 @@ impl App {
             sessions: store::session_summaries(conn)?,
             breakdown: store::breakdown(conn)?,
             warnings: store::warning_breakdown(conn)?,
+            usage: store::provider_usage(conn)?,
             screen: Screen::Overview,
             selected: 0,
             detail: None,
             should_quit: false,
+            use_color: std::env::var_os("NO_COLOR").is_none(),
         })
     }
 }
@@ -232,7 +238,13 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
         kv("measured tokens", ov.measured_tokens.to_string()),
         kv("estimated tokens", ov.estimated_tokens.to_string()),
         Line::raw(""),
+        Line::styled(
+            "Usage by provider",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
     ];
+    lines.extend(usage_bar_lines(&app.usage, app.use_color));
+    lines.push(Line::raw(""));
     if ov.top_sessions.is_empty() {
         lines.push(Line::raw("No sessions yet. Import a source to begin."));
     } else {
@@ -347,7 +359,13 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
 
 fn breakdown_lines(app: &App) -> Vec<Line<'static>> {
     let bd = &app.breakdown;
-    let mut lines = vec![Line::raw("Tokens (measured and estimated kept apart):")];
+    let mut lines = vec![Line::styled(
+        "Usage by provider",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    lines.extend(usage_bar_lines(&app.usage, app.use_color));
+    lines.push(Line::raw(""));
+    lines.push(Line::raw("Tokens (measured and estimated kept apart):"));
     lines.push(token_parts_line("measured", &bd.tokens.measured));
     lines.push(token_parts_line("estimated", &bd.tokens.estimated));
 
@@ -413,6 +431,137 @@ fn token_parts_line(label: &str, p: &store::TokenParts) -> Line<'static> {
         "  {label:>9}: total {}  (in {}  out {}  cache-read {}  cache-create {})",
         p.total, p.input, p.output, p.cache_read, p.cache_creation
     ))
+}
+
+/// How wide the stacked usage bar is drawn, in columns. Fixed so the builders
+/// stay terminal-free and the bar reads the same on any terminal width.
+const BAR_WIDTH: u16 = 40;
+
+/// One coloured slice of a usage bar: a provider, the raw value that sizes its
+/// segment, and the value as it should read in the legend.
+struct Segment {
+    label: String,
+    value: u64,
+    value_text: String,
+    color: Color,
+}
+
+/// Build the provider usage bars: measured tokens, estimated tokens, and cost,
+/// each a stacked bar over a legend. Measured and estimated stay on separate
+/// bars and are never merged. Empty usage renders a friendly note per bar.
+fn usage_bar_lines(usage: &store::ProviderUsage, use_color: bool) -> Vec<Line<'static>> {
+    let token_segments = |band: fn(&store::ProviderTokens) -> u64| -> Vec<Segment> {
+        usage
+            .tokens
+            .iter()
+            .map(|t| Segment {
+                label: t.provider.clone(),
+                value: band(t),
+                value_text: band(t).to_string(),
+                color: provider::provider_color(&t.provider),
+            })
+            .collect()
+    };
+    let cost: Vec<Segment> = usage
+        .cost
+        .iter()
+        .map(|c| Segment {
+            label: c.provider.clone(),
+            value: c.amount_minor.max(0) as u64,
+            value_text: fmt_cost(c.amount_minor, &c.currency),
+            color: provider::provider_color(&c.provider),
+        })
+        .collect();
+
+    let mut lines = one_bar(
+        "Measured tokens",
+        &token_segments(|t| t.measured),
+        use_color,
+    );
+    lines.push(Line::raw(""));
+    lines.extend(one_bar(
+        "Estimated tokens",
+        &token_segments(|t| t.estimated),
+        use_color,
+    ));
+    lines.push(Line::raw(""));
+    lines.extend(one_bar("Cost", &cost, use_color));
+    lines
+}
+
+/// One titled bar with its legend. A bar with no total renders a friendly note
+/// instead of an empty or zero-width bar.
+fn one_bar(title: &str, segs: &[Segment], use_color: bool) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::styled(
+        title.to_string(),
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    let total: u64 = segs.iter().map(|s| s.value).sum();
+    if total == 0 {
+        lines.push(Line::raw("  (no usage yet)"));
+        return lines;
+    }
+
+    let values: Vec<u64> = segs.iter().map(|s| s.value).collect();
+    let widths = segment_widths(&values, BAR_WIDTH);
+    let mut bar = vec![Span::raw("  [")];
+    for (i, (seg, w)) in segs.iter().zip(&widths).enumerate() {
+        if *w == 0 {
+            continue;
+        }
+        let glyph = if use_color { "█" } else { mono_glyph(i) };
+        let run = glyph.repeat(*w as usize);
+        if use_color {
+            bar.push(Span::styled(run, Style::default().fg(seg.color)));
+        } else {
+            bar.push(Span::raw(run));
+        }
+    }
+    bar.push(Span::raw("]"));
+    lines.push(Line::from(bar));
+
+    let mut legend = vec![Span::raw("  ")];
+    for (i, seg) in segs.iter().enumerate() {
+        if i > 0 {
+            legend.push(Span::raw("   "));
+        }
+        if use_color {
+            legend.push(Span::styled("● ", Style::default().fg(seg.color)));
+        } else {
+            legend.push(Span::raw(format!("{} ", mono_glyph(i))));
+        }
+        legend.push(Span::raw(format!("{} {}", seg.label, seg.value_text)));
+    }
+    lines.push(Line::from(legend));
+    lines
+}
+
+/// A distinct fill glyph per segment for the no-colour path, cycled by index so
+/// neighbours stay distinguishable without colour.
+fn mono_glyph(i: usize) -> &'static str {
+    const GLYPHS: [&str; 8] = ["#", "=", "+", "*", "o", "~", ":", "%"];
+    GLYPHS[i % GLYPHS.len()]
+}
+
+/// Split `width` columns across `values` in proportion to each value, using
+/// cumulative rounding so the parts always sum to exactly `width`. A zero total
+/// or zero width yields all-zero widths and never a negative one.
+fn segment_widths(values: &[u64], width: u16) -> Vec<u16> {
+    let total: u128 = values.iter().map(|&v| v as u128).sum();
+    if total == 0 || width == 0 {
+        return vec![0; values.len()];
+    }
+    let w = width as u128;
+    let mut out = Vec::with_capacity(values.len());
+    let mut cum: u128 = 0;
+    let mut prev: u128 = 0;
+    for &v in values {
+        cum += v as u128;
+        let boundary = (cum * w + total / 2) / total;
+        out.push((boundary - prev) as u16);
+        prev = boundary;
+    }
+    out
 }
 
 fn session_row(s: &store::SessionSummary) -> String {
@@ -486,10 +635,12 @@ mod tests {
             sessions: Vec::new(),
             breakdown: store::Breakdown::default(),
             warnings: Vec::new(),
+            usage: store::ProviderUsage::default(),
             screen: Screen::Overview,
             selected: 0,
             detail: None,
             should_quit: false,
+            use_color: false,
         }
     }
 
@@ -563,10 +714,23 @@ mod tests {
                 message: "file attribution unavailable".to_string(),
                 count: 1,
             }],
+            usage: store::ProviderUsage {
+                tokens: vec![store::ProviderTokens {
+                    provider: "anthropic".to_string(),
+                    measured: 120,
+                    estimated: 40,
+                }],
+                cost: vec![store::ProviderCost {
+                    provider: "anthropic".to_string(),
+                    amount_minor: 15,
+                    currency: Some("USD".to_string()),
+                }],
+            },
             screen: Screen::Detail,
             selected: 0,
             detail: Some(detail),
             should_quit: false,
+            use_color: true,
         }
     }
 
@@ -703,5 +867,38 @@ mod tests {
             full.screen = screen;
             terminal.draw(|f| render(f, &full)).unwrap();
         }
+    }
+
+    #[test]
+    fn usage_bar_keeps_measured_and_estimated_separate() {
+        let mut app = populated_app();
+        app.screen = Screen::Overview;
+        let text = plain(&overview_lines(&app));
+        assert!(text.contains("Usage by provider"));
+        assert!(text.contains("Measured tokens"));
+        assert!(text.contains("Estimated tokens"));
+        // The provider value shows under each band on its own, never summed.
+        assert!(text.contains("anthropic 120"));
+        assert!(text.contains("anthropic 40"));
+        assert!(!text.contains("160"));
+        // Cost rides its own bar with the formatted amount.
+        assert!(text.contains("anthropic 0.15 USD"));
+    }
+
+    #[test]
+    fn empty_usage_bar_shows_a_friendly_note() {
+        let text = plain(&overview_lines(&empty_app()));
+        assert!(text.contains("Usage by provider"));
+        assert!(text.contains("(no usage yet)"));
+    }
+
+    #[test]
+    fn segment_widths_sum_to_the_bar_width() {
+        assert_eq!(segment_widths(&[1, 1], 40).iter().sum::<u16>(), 40);
+        assert_eq!(segment_widths(&[3, 1], 40), vec![30, 10]);
+        // A zero total, empty input, or zero width never panics.
+        assert_eq!(segment_widths(&[0, 0], 40), vec![0, 0]);
+        assert!(segment_widths(&[], 40).is_empty());
+        assert_eq!(segment_widths(&[5], 0), vec![0]);
     }
 }
