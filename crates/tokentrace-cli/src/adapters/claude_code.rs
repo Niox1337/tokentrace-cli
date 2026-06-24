@@ -25,6 +25,9 @@ use tokentrace_core::{
 
 /// One redacted OTLP/JSON logs export covering api_request and tool_result events.
 const FIXTURE_OTLP_LOGS: &[u8] = include_bytes!("../../../../fixtures/claude-code/otlp_logs.json");
+/// One redacted OTLP/JSON metrics export covering the no-events fallback path.
+const FIXTURE_OTLP_METRICS: &[u8] =
+    include_bytes!("../../../../fixtures/claude-code/otlp_metrics.json");
 
 /// Adapter id used on the CLI and in stored source rows.
 pub const ID: &str = "claude-code";
@@ -82,10 +85,16 @@ impl Adapter for ClaudeCode {
     }
 
     fn fixtures(&self) -> Vec<Fixture> {
-        vec![Fixture {
-            name: "otlp_logs",
-            bytes: FIXTURE_OTLP_LOGS,
-        }]
+        vec![
+            Fixture {
+                name: "otlp_logs",
+                bytes: FIXTURE_OTLP_LOGS,
+            },
+            Fixture {
+                name: "otlp_metrics",
+                bytes: FIXTURE_OTLP_METRICS,
+            },
+        ]
     }
 }
 
@@ -591,6 +600,24 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn metrics_fixture_parses_to_aggregate_records() {
+        let data = ClaudeCode.parse(FIXTURE_OTLP_METRICS).unwrap();
+        // One session, one synthetic request per (session, model).
+        assert_eq!(data.sessions.len(), 1);
+        assert_eq!(data.requests.len(), 2);
+        // Find the opus request and check its summed measured total and estimated cost.
+        let opus = data
+            .requests
+            .iter()
+            .position(|r| r.model == "claude-opus-4-8")
+            .unwrap();
+        assert_eq!(data.tokens[opus].total, 5000 + 1200 + 3000 + 256);
+        assert_eq!(data.tokens[opus].confidence, Confidence::Measured);
+        assert_eq!(data.costs[opus].amount_minor, 105);
+        assert_eq!(data.costs[opus].confidence, Confidence::Estimated);
     }
 
     #[test]
