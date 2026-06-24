@@ -6,10 +6,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.9.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Niox1337/tokentrace-cli"
+homepage = "https://github.com/Niox1337/tokentrace-cli"
+keywords = ["tokens", "cost", "llm", "telemetry", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 tokentrace-core = { path = "crates/tokentrace-core" }
