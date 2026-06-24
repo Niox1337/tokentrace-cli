@@ -3,6 +3,12 @@
 All notable changes are recorded here. This project follows SemVer. Pre-1.0
 minors may break, and the adapter API stays experimental until 1.0.0.
 
+## [0.9.1] - TUI tab navigation keys
+
+### Added
+
+- Switch tabs with the left and right arrow keys, wrapping at the ends
+
 ## [0.9.0] - Release candidate
 
 ### Added
