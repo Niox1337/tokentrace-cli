@@ -33,6 +33,16 @@ pub enum Screen {
     Warnings,
 }
 
+/// Tab order, shared by the tab bar and the left/right tab keys. Detail is a
+/// sub-screen of Sessions, so it is not a tab.
+const TABS: [(Screen, &str); 5] = [
+    (Screen::Overview, "1 Overview"),
+    (Screen::Sources, "2 Sources"),
+    (Screen::Sessions, "3 Sessions"),
+    (Screen::Breakdown, "4 Breakdown"),
+    (Screen::Warnings, "5 Warnings"),
+];
+
 /// The loaded, read-only view of the store plus cursor state. Loaded once at
 /// launch; session detail is fetched lazily when a session is opened. The
 /// viewer never mutates the store.
@@ -111,6 +121,8 @@ fn handle_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('3') => app.screen = Screen::Sessions,
         KeyCode::Char('4') => app.screen = Screen::Breakdown,
         KeyCode::Char('5') => app.screen = Screen::Warnings,
+        KeyCode::Left => app.screen = cycle_tab(app.screen, -1),
+        KeyCode::Right => app.screen = cycle_tab(app.screen, 1),
         KeyCode::Up => {
             if app.screen == Screen::Sessions {
                 app.selected = app.selected.saturating_sub(1);
@@ -132,6 +144,16 @@ fn handle_key(app: &mut App, code: KeyCode) {
         },
         _ => {}
     }
+}
+
+/// Step `delta` tabs from the current screen, wrapping at the ends. A non-tab
+/// screen (Detail) is left unchanged so the arrows do not jump out of it.
+fn cycle_tab(current: Screen, delta: isize) -> Screen {
+    let Some(i) = TABS.iter().position(|(s, _)| *s == current) else {
+        return current;
+    };
+    let n = TABS.len() as isize;
+    TABS[(((i as isize + delta) % n + n) % n) as usize].0
 }
 
 /// Load the detail for the selected session when the detail screen is open and
@@ -179,15 +201,8 @@ pub fn render(f: &mut Frame, app: &App) {
 }
 
 fn tab_bar(current: Screen) -> Line<'static> {
-    let tabs = [
-        (Screen::Overview, "1 Overview"),
-        (Screen::Sources, "2 Sources"),
-        (Screen::Sessions, "3 Sessions"),
-        (Screen::Breakdown, "4 Breakdown"),
-        (Screen::Warnings, "5 Warnings"),
-    ];
     let mut spans = vec![Span::raw("tokentrace  ")];
-    for (screen, label) in tabs {
+    for (screen, label) in TABS {
         let style = if screen == current {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
@@ -201,9 +216,9 @@ fn tab_bar(current: Screen) -> Line<'static> {
 
 fn footer(screen: Screen) -> &'static str {
     match screen {
-        Screen::Sessions => "1-5 screens  up/down select  enter open  q quit",
-        Screen::Detail => "1-5 screens  esc back  q quit",
-        _ => "1-5 screens  q quit",
+        Screen::Sessions => "1-5/arrows tabs  up/down select  enter open  q quit",
+        Screen::Detail => "1-5 tabs  esc back  q quit",
+        _ => "1-5/arrows tabs  q quit",
     }
 }
 
@@ -607,6 +622,22 @@ mod tests {
         let mut app = empty_app();
         handle_key(&mut app, KeyCode::Char('4'));
         assert_eq!(app.screen, Screen::Breakdown);
+    }
+
+    #[test]
+    fn left_right_cycle_through_tabs_with_wrap() {
+        let mut app = empty_app();
+        // Right walks the tab order.
+        handle_key(&mut app, KeyCode::Right);
+        assert_eq!(app.screen, Screen::Sources);
+        // Left from the first tab wraps to the last.
+        app.screen = Screen::Overview;
+        handle_key(&mut app, KeyCode::Left);
+        assert_eq!(app.screen, Screen::Warnings);
+        // Arrows leave the detail sub-screen unchanged.
+        app.screen = Screen::Detail;
+        handle_key(&mut app, KeyCode::Right);
+        assert_eq!(app.screen, Screen::Detail);
     }
 
     #[test]
