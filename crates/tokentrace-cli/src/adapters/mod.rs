@@ -9,7 +9,9 @@
 pub mod claude_code;
 pub mod codex;
 
-use tokentrace_core::{Adapter, Capabilities};
+use std::path::{Path, PathBuf};
+
+use tokentrace_core::{Adapter, Capabilities, Detection};
 
 /// A bundled adapter, as shown by `tokentrace adapters list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +117,59 @@ pub(crate) fn iso_to_unix(s: &str) -> Option<i64> {
     Some(days * 86_400 + hour * 3_600 + min * 60 + sec)
 }
 
+/// The user's home directory, from `USERPROFILE` on Windows or `HOME` elsewhere.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+/// Build detections for an adapter's local session logs: every `.jsonl` under
+/// `~/<subdir...>` whose name starts with `prefix` (when given). Returns an empty
+/// list when the directory is absent, so a missing tool is simply not detected.
+pub(crate) fn detect_sessions(subdir: &[&str], prefix: Option<&str>) -> Vec<Detection> {
+    let Some(mut root) = home_dir() else {
+        return Vec::new();
+    };
+    for part in subdir {
+        root.push(part);
+    }
+    let evidence = format!("session log under {}", root.display());
+    find_jsonl(&root, prefix)
+        .into_iter()
+        .map(|p| Detection {
+            locator: p.display().to_string(),
+            evidence: evidence.clone(),
+        })
+        .collect()
+}
+
+/// Recursively collect files under `root` ending in `.jsonl` whose name starts
+/// with `prefix` (when given). Sorted for stable output. An unreadable directory
+/// is skipped rather than failing the walk.
+pub(crate) fn find_jsonl(root: &Path, prefix: Option<&str>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_jsonl(root, prefix, &mut out);
+    out.sort();
+    out
+}
+
+fn collect_jsonl(dir: &Path, prefix: Option<&str>, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_jsonl(&path, prefix, out);
+        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.ends_with(".jsonl") && prefix.is_none_or(|p| name.starts_with(p)) {
+                out.push(path);
+            }
+        }
+    }
+}
+
 /// Days since the unix epoch for a proleptic Gregorian date (Hinnant's algorithm).
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
@@ -135,5 +190,26 @@ mod tests {
         assert_eq!(iso_to_unix("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(iso_to_unix("2026-03-13T23:48:30.000Z"), Some(1_773_445_710));
         assert_eq!(iso_to_unix("not-a-timestamp"), None);
+    }
+
+    #[test]
+    fn find_jsonl_filters_by_prefix_and_extension() {
+        let base = std::env::temp_dir().join(format!("tt_find_{}", std::process::id()));
+        let nested = base.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("rollout-1.jsonl"), b"{}").unwrap();
+        std::fs::write(nested.join("other.jsonl"), b"{}").unwrap();
+        std::fs::write(base.join("rollout-2.jsonl"), b"{}").unwrap();
+        std::fs::write(base.join("notes.txt"), b"x").unwrap();
+
+        // All three .jsonl found recursively; the .txt is excluded.
+        assert_eq!(find_jsonl(&base, None).len(), 3);
+        // The prefix narrows to the two rollout files.
+        let rollouts = find_jsonl(&base, Some("rollout-"));
+        assert_eq!(rollouts.len(), 2);
+        // Sorted output is stable.
+        assert!(rollouts.windows(2).all(|w| w[0] <= w[1]));
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

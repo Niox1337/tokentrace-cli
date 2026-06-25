@@ -61,10 +61,12 @@ impl Adapter for Codex {
         capabilities()
     }
 
-    /// Sources are registered explicitly for now; auto-discovery of the codex
-    /// session directory lands in a later milestone.
+    /// Find rollout session logs under `~/.codex/sessions`.
     fn detect(&self) -> Result<Vec<Detection>> {
-        Ok(Vec::new())
+        Ok(super::detect_sessions(
+            &[".codex", "sessions"],
+            Some("rollout-"),
+        ))
     }
 
     fn parse(&self, raw: &[u8]) -> Result<ParsedData> {

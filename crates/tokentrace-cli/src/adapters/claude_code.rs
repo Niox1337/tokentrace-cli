@@ -71,10 +71,9 @@ impl Adapter for ClaudeCode {
         capabilities()
     }
 
-    /// Sources are registered explicitly with `sources add`; this adapter does
-    /// not probe the filesystem, so detection finds nothing on its own.
+    /// Find native session transcripts under `~/.claude/projects`.
     fn detect(&self) -> Result<Vec<Detection>> {
-        Ok(Vec::new())
+        Ok(super::detect_sessions(&[".claude", "projects"], None))
     }
 
     fn parse(&self, raw: &[u8]) -> Result<ParsedData> {
