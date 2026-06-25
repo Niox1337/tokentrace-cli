@@ -9,6 +9,7 @@ installed.
 | Adapter     | Id          | Status    | Version |
 | ----------- | ----------- | --------- | ------- |
 | Claude Code | claude-code | supported | 0.4.0   |
+| Codex CLI   | codex       | supported | 0.10.0  |
 
 A `supported` adapter ships a parser and at least one redacted fixture that a
 test pins to expected model output.
@@ -18,16 +19,16 @@ test pins to expected model output.
 A capability is what the adapter can recover from its source, not a promise the
 source always carries it.
 
-| Capability       | claude-code     |
-| ---------------- | --------------- |
-| Measured tokens  | yes             |
-| Estimated tokens | no              |
-| Cost             | yes (estimated) |
-| Tool calls       | yes             |
-| File paths       | no              |
-| Git signals      | yes             |
-| Raw bodies       | no              |
-| Privacy level    | redacted        |
+| Capability       | claude-code     | codex    |
+| ---------------- | --------------- | -------- |
+| Measured tokens  | yes             | yes      |
+| Estimated tokens | no              | no       |
+| Cost             | yes (estimated) | no       |
+| Tool calls       | yes             | no       |
+| File paths       | no              | no       |
+| Git signals      | yes             | no       |
+| Raw bodies       | no              | no       |
+| Privacy level    | redacted        | redacted |
 
 ## Notes per capability
 
@@ -40,6 +41,9 @@ source always carries it.
   needs `OTEL_LOG_TOOL_DETAILS` enabled at capture time.
 - File paths and raw bodies are withheld by the source. The adapter records a
   redaction warning rather than guessing.
+- Codex native rollout logs report per-turn token counts under `token_count`
+  events, mapped to the measured band. They carry no cost, so cost stays
+  unavailable for codex.
 
 See [research/claude-code.md](research/claude-code.md) for the exact source
 shapes and attribute keys, and [privacy.md](privacy.md) for the confidence

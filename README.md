@@ -45,6 +45,10 @@ recovers measured tokens, estimated cost, tool calls, and git signals. File
 paths and raw bodies are withheld by the source, so those gaps are reported as
 warnings rather than guessed.
 
+Codex CLI is the second adapter. It reads native rollout session logs from
+`~/.codex/sessions` and recovers measured per-turn token counts. The logs carry
+no cost, so cost is reported as unavailable.
+
 See [docs/adapters.md](docs/adapters.md) for the support matrix and
 [docs/research/claude-code.md](docs/research/claude-code.md) for the source
 shapes the adapter parses.
