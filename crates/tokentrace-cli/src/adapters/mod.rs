@@ -83,3 +83,57 @@ pub fn caps_summary(c: &Capabilities) -> String {
         c.privacy_level.as_str()
     )
 }
+
+/// Convert a fixed-width UTC ISO 8601 timestamp (`YYYY-MM-DDTHH:MM:SS...`) to
+/// unix seconds. Fractional seconds and any trailing `Z` are ignored. Returns
+/// `None` on any unexpected shape. Shared by the adapters that read ISO times.
+///
+/// ponytail: avoids a date-crate dependency for one fixed format; the civil-days
+/// conversion is exact for all calendar dates, so no chrono needed here.
+pub(crate) fn iso_to_unix(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 19
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let num = |from: usize, to: usize| s.get(from..to)?.parse::<i64>().ok();
+    let year = num(0, 4)?;
+    let month = num(5, 7)?;
+    let day = num(8, 10)?;
+    let hour = num(11, 13)?;
+    let min = num(14, 16)?;
+    let sec = num(17, 19)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some(days * 86_400 + hour * 3_600 + min * 60 + sec)
+}
+
+/// Days since the unix epoch for a proleptic Gregorian date (Hinnant's algorithm).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iso_to_unix_matches_known_epochs() {
+        assert_eq!(iso_to_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(iso_to_unix("2026-03-13T23:48:30.000Z"), Some(1_773_445_710));
+        assert_eq!(iso_to_unix("not-a-timestamp"), None);
+    }
+}

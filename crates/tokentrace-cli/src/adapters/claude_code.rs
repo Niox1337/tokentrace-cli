@@ -28,6 +28,9 @@ const FIXTURE_OTLP_LOGS: &[u8] = include_bytes!("../../../../fixtures/claude-cod
 /// One redacted OTLP/JSON metrics export covering the no-events fallback path.
 const FIXTURE_OTLP_METRICS: &[u8] =
     include_bytes!("../../../../fixtures/claude-code/otlp_metrics.json");
+/// One redacted native session transcript (JSONL) covering the on-disk format.
+const FIXTURE_NATIVE: &[u8] =
+    include_bytes!("../../../../fixtures/claude-code/native_transcript.jsonl");
 
 /// Adapter id used on the CLI and in stored source rows.
 pub const ID: &str = "claude-code";
@@ -75,7 +78,7 @@ impl Adapter for ClaudeCode {
     }
 
     fn parse(&self, raw: &[u8]) -> Result<ParsedData> {
-        parse_otlp(raw)
+        parse_export(raw)
     }
 
     fn validate(&self, data: &ParsedData) -> Vec<Warning> {
@@ -94,8 +97,143 @@ impl Adapter for ClaudeCode {
                 name: "otlp_metrics",
                 bytes: FIXTURE_OTLP_METRICS,
             },
+            Fixture {
+                name: "native_transcript",
+                bytes: FIXTURE_NATIVE,
+            },
         ]
     }
+}
+
+/// Dispatch by format: an OTLP/JSON export is one object with `resourceLogs` or
+/// `resourceMetrics`; anything else is treated as a native session transcript
+/// (the JSONL Claude Code writes under `~/.claude/projects`).
+pub fn parse_export(raw: &[u8]) -> Result<ParsedData> {
+    if let Ok(root) = serde_json::from_slice::<Value>(raw) {
+        if root.get("resourceLogs").is_some() || root.get("resourceMetrics").is_some() {
+            return parse_otlp(raw);
+        }
+    }
+    parse_native_jsonl(raw)
+}
+
+/// Parse a native Claude Code session transcript (JSONL). Each assistant line
+/// carries `message.usage` (measured tokens) and `message.model`; lines without
+/// usage (user turns, summaries) are skipped. Transcripts carry no cost.
+pub fn parse_native_jsonl(raw: &[u8]) -> Result<ParsedData> {
+    let text = std::str::from_utf8(raw).context("claude transcript is not UTF-8")?;
+    let mut sessions: BTreeMap<String, Session> = BTreeMap::new();
+    let mut next_seq: HashMap<String, u32> = HashMap::new();
+    let mut turns = Vec::new();
+    let mut requests = Vec::new();
+    let mut tokens = Vec::new();
+    let mut costs = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(rec) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let message = &rec["message"];
+        let usage = match message.get("usage") {
+            Some(u) if u.is_object() => u,
+            _ => continue,
+        };
+
+        let external = rec
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let (sid, hash) = session_ids(external);
+        let ts = rec
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(super::iso_to_unix);
+        let branch = rec
+            .get("gitBranch")
+            .and_then(Value::as_str)
+            .filter(|b| !b.is_empty())
+            .map(String::from);
+
+        let s = sessions.entry(sid.clone()).or_insert_with(|| Session {
+            id: sid.clone(),
+            external_id_hash: hash,
+            repo: None,
+            branch: branch.clone(),
+            commit_before: None,
+            commit_after: None,
+            started_at: ts,
+            ended_at: ts,
+            status: SessionStatus::Unknown,
+        });
+        if s.branch.is_none() {
+            s.branch = branch;
+        }
+        if let Some(t) = ts {
+            if s.started_at.is_none_or(|x| t < x) {
+                s.started_at = Some(t);
+            }
+            if s.ended_at.is_none_or(|x| t > x) {
+                s.ended_at = Some(t);
+            }
+        }
+
+        let seq = {
+            let n = next_seq.entry(sid.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        let prompt = rec.get("uuid").and_then(Value::as_str).unwrap_or_default();
+        turns.push(Turn {
+            session_id: sid.clone(),
+            sequence: seq,
+            external_id_hash: (!prompt.is_empty()).then(|| sha256_hex(prompt)),
+            started_at: ts,
+            duration_ms: None,
+            outcome: None,
+        });
+        requests.push(ModelRequest {
+            turn_id: turn_id(&sid, seq),
+            model: message
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            provider: "anthropic".to_string(),
+            requested_at: ts,
+            duration_ms: None,
+            success: Some(true),
+        });
+        let u = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let input = u("input_tokens");
+        let output = u("output_tokens");
+        let cache_read = u("cache_read_input_tokens");
+        let cache_creation = u("cache_creation_input_tokens");
+        tokens.push(TokenUsage {
+            input,
+            output,
+            cache_read,
+            cache_creation,
+            total: input + output + cache_read + cache_creation,
+            confidence: Confidence::Measured,
+        });
+        // Native transcripts carry no cost.
+        costs.push(cost(0, Confidence::Unknown));
+    }
+
+    Ok(ParsedData {
+        sessions: sessions.into_values().collect(),
+        turns,
+        requests,
+        tokens,
+        costs,
+        tools: Vec::new(),
+        files: Vec::new(),
+        commits: Vec::new(),
+    })
 }
 
 /// The turn id stored for a `(session, sequence)` pair. Shared with the store so
@@ -639,5 +777,42 @@ mod tests {
             .filter(|w| w.kind == WarningKind::Redaction)
             .count();
         assert_eq!(redactions, 2);
+    }
+
+    #[test]
+    fn native_transcript_maps_usage_and_skips_user_turns() {
+        // The fixture has one user line (no usage) and two assistant lines.
+        let data = parse_native_jsonl(FIXTURE_NATIVE).unwrap();
+        assert_eq!(data.sessions.len(), 1);
+        assert_eq!(data.requests.len(), 2);
+        assert_eq!(data.sessions[0].branch.as_deref(), Some("main"));
+        assert!(data.requests.iter().all(|r| r.provider == "anthropic"));
+        assert!(data.requests.iter().all(|r| r.model == "claude-opus-4-8"));
+
+        // 5448 + 237 + 13340 + 7631
+        assert_eq!(data.tokens[0].total, 26656);
+        let measured: u64 = data
+            .tokens
+            .iter()
+            .filter(|t| t.confidence == Confidence::Measured)
+            .map(|t| t.total)
+            .sum();
+        assert_eq!(measured, 52806);
+
+        // Transcripts carry no cost.
+        assert!(data
+            .costs
+            .iter()
+            .all(|c| c.confidence == Confidence::Unknown));
+    }
+
+    #[test]
+    fn parse_export_routes_otlp_and_jsonl() {
+        // An OTLP object routes to the metrics/events parser.
+        let otlp = parse_export(&api_request_export()).unwrap();
+        assert_eq!(otlp.requests.len(), 2);
+        // A JSONL transcript routes to the native parser.
+        let native = parse_export(FIXTURE_NATIVE).unwrap();
+        assert_eq!(native.requests.len(), 2);
     }
 }
