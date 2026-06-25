@@ -28,6 +28,7 @@ dependency to install.
 tokentrace doctor                       # environment and store status
 tokentrace adapters list                # bundled adapters and capabilities
 tokentrace import --adapter claude-code --path export.json
+tokentrace scan                         # discover and import local Claude and Codex logs
 tokentrace sources list                 # imported sources
 tokentrace tui                          # browse the store
 tokentrace export --out sessions.jsonl  # newline-delimited JSON per session
@@ -48,6 +49,11 @@ warnings rather than guessed.
 Codex CLI is the second adapter. It reads native rollout session logs from
 `~/.codex/sessions` and recovers measured per-turn token counts. The logs carry
 no cost, so cost is reported as unavailable.
+
+Run `tokentrace scan` to load both automatically. It finds Claude Code
+transcripts under `~/.claude/projects` and Codex rollouts under
+`~/.codex/sessions`, imports what it finds, and is safe to re-run. Scan does not
+store the raw bytes, so prompt-bearing native logs stay out of the store.
 
 See [docs/adapters.md](docs/adapters.md) for the support matrix and
 [docs/research/claude-code.md](docs/research/claude-code.md) for the source

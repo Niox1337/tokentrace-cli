@@ -49,6 +49,8 @@ enum Command {
         #[command(subcommand)]
         command: AdaptersCommand,
     },
+    /// Discover and import local Claude Code and Codex session logs.
+    Scan,
     /// Browse the store in the terminal UI.
     Tui,
     /// Export the store as newline-delimited JSON, one object per session.
@@ -122,6 +124,7 @@ fn main() -> anyhow::Result<()> {
         Command::Adapters {
             command: AdaptersCommand::List,
         } => adapters_list(),
+        Command::Scan => scan()?,
         Command::Tui => {
             let conn = store::open(&store::default_store_path())?;
             tui::run(&conn)?;
@@ -205,6 +208,81 @@ fn git_summary(
             );
             println!("        warning: {}", w.message);
         }
+    }
+    Ok(())
+}
+
+/// Discover local Claude Code and Codex session logs through each adapter's
+/// `detect`, then import what they find. Safe to re-run; the import is
+/// idempotent. The raw bytes are not stored, since native logs carry prompts.
+fn scan() -> anyhow::Result<()> {
+    let mut conn = store::open(&store::default_store_path())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64);
+
+    let mut total_files = 0usize;
+    let mut total_measured = 0u64;
+    for info in adapters::list() {
+        let Some(runner) = adapters::build(info.id) else {
+            continue;
+        };
+        let detections = runner.detect()?;
+        if detections.is_empty() {
+            continue;
+        }
+        println!(
+            "{} ({}): {} session file(s)",
+            info.name,
+            info.id,
+            detections.len()
+        );
+        let mut measured = 0u64;
+        for d in &detections {
+            let path = PathBuf::from(&d.locator);
+            let raw = match std::fs::read(&path) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("  skipped {}: {e}", path.display());
+                    continue;
+                }
+            };
+            let data = match runner.parse(&raw) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("  skipped {}: {e}", path.display());
+                    continue;
+                }
+            };
+            let warnings = runner.validate(&data);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| info.id.to_string());
+            let source = AgentSource {
+                id: source_id(info.id, &name, &path),
+                name,
+                source_type: SourceType::LocalFile,
+                adapter_id: info.id.to_string(),
+                adapter_version: info.version.to_string(),
+                capabilities: info.capabilities,
+                imported_at: now,
+            };
+            store::ensure_source(&conn, &source)?;
+            // Empty raw keeps prompt-bearing native logs out of the store.
+            let counts = store::import_parsed(&mut conn, &source.id, b"", &data, &warnings)?;
+            measured += counts.measured_tokens;
+            total_files += 1;
+        }
+        println!("  imported {measured} new measured tokens");
+        total_measured += measured;
+    }
+
+    if total_files == 0 {
+        println!("No local Claude Code or Codex session logs found.");
+    } else {
+        println!("Scanned {total_files} file(s); {total_measured} new measured tokens.");
     }
     Ok(())
 }
