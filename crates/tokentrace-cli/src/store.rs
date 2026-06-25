@@ -337,7 +337,7 @@ pub fn import_parsed(
     let mut measured_tokens = 0u64;
     for (i, r) in data.requests.iter().enumerate() {
         let request_id = format!("{source_id}-r{i}");
-        tx.execute(
+        let inserted = tx.execute(
             "INSERT OR IGNORE INTO requests \
              (id, turn_id, model, provider, requested_at, duration_ms, success) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -351,6 +351,12 @@ pub fn import_parsed(
                 r.success,
             ],
         )?;
+        // Token and cost rows have no unique key, so only write them for a
+        // request we just inserted. This keeps a re-run (for example `scan`)
+        // idempotent instead of double counting an already-imported file.
+        if inserted == 0 {
+            continue;
+        }
         if let Some(u) = data.tokens.get(i) {
             if u.confidence == Confidence::Measured {
                 measured_tokens += u.total;
@@ -1180,6 +1186,88 @@ mod tests {
             .query_row("SELECT count(*) FROM raw_sources", [], |r| r.get(0))
             .unwrap();
         assert_eq!(raw_rows, 1);
+    }
+
+    #[test]
+    fn reimporting_the_same_source_does_not_double_count() {
+        use tokentrace_core::{
+            Confidence, CostUsage, ModelRequest, ParsedData, Session, SessionStatus, TokenUsage,
+            Turn,
+        };
+
+        let mut conn = memory_store();
+        let src = AgentSource {
+            id: "src1".to_string(),
+            name: "logs".to_string(),
+            source_type: tokentrace_core::SourceType::LocalFile,
+            adapter_id: "codex".to_string(),
+            adapter_version: "0.10.0".to_string(),
+            capabilities: tokentrace_core::Capabilities::default(),
+            imported_at: Some(1),
+        };
+        insert_source(&conn, &src).unwrap();
+
+        let data = ParsedData {
+            sessions: vec![Session {
+                id: "sess".to_string(),
+                external_id_hash: "hash".to_string(),
+                repo: None,
+                branch: None,
+                commit_before: None,
+                commit_after: None,
+                started_at: Some(10),
+                ended_at: Some(20),
+                status: SessionStatus::Unknown,
+            }],
+            turns: vec![Turn {
+                session_id: "sess".to_string(),
+                sequence: 1,
+                external_id_hash: None,
+                started_at: Some(10),
+                duration_ms: None,
+                outcome: None,
+            }],
+            requests: vec![ModelRequest {
+                turn_id: turn_id("sess", 1),
+                model: "gpt-5.4".to_string(),
+                provider: "openai".to_string(),
+                requested_at: Some(10),
+                duration_ms: None,
+                success: Some(true),
+            }],
+            tokens: vec![TokenUsage {
+                input: 100,
+                output: 20,
+                cache_read: 0,
+                cache_creation: 0,
+                total: 120,
+                confidence: Confidence::Measured,
+            }],
+            costs: vec![CostUsage {
+                amount_minor: 0,
+                currency: "USD".to_string(),
+                pricing_source: "codex".to_string(),
+                confidence: Confidence::Unknown,
+            }],
+            tools: Vec::new(),
+            files: Vec::new(),
+            commits: Vec::new(),
+        };
+
+        let first = import_parsed(&mut conn, "src1", b"{}", &data, &[]).unwrap();
+        assert_eq!(first.measured_tokens, 120);
+        // A second import of the same source adds no new token or cost rows.
+        let second = import_parsed(&mut conn, "src1", b"{}", &data, &[]).unwrap();
+        assert_eq!(second.measured_tokens, 0);
+
+        let usage_rows: i64 = conn
+            .query_row("SELECT count(*) FROM usage", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(usage_rows, 1);
+        let cost_rows: i64 = conn
+            .query_row("SELECT count(*) FROM costs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cost_rows, 1);
     }
 
     #[test]
