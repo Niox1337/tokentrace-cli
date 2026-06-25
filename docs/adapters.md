@@ -45,6 +45,15 @@ source always carries it.
   events, mapped to the measured band. They carry no cost, so cost stays
   unavailable for codex.
 
+## Discovery
+
+`tokentrace scan` finds and imports each adapter's local session logs without an
+export step. The claude-code adapter reads native transcripts under
+`~/.claude/projects`, and the codex adapter reads rollout logs under
+`~/.codex/sessions`. Scan is idempotent and does not store raw bytes, so
+prompt-bearing native logs are never persisted. The claude-code adapter also
+still reads OpenTelemetry exports passed to `import --path`.
+
 See [research/claude-code.md](research/claude-code.md) for the exact source
 shapes and attribute keys, and [privacy.md](privacy.md) for the confidence
 bands and the opt-in sensitive-import gate.

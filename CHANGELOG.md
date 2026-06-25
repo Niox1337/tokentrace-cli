@@ -3,6 +3,23 @@
 All notable changes are recorded here. This project follows SemVer. Pre-1.0
 minors may break, and the adapter API stays experimental until 1.0.0.
 
+## [0.11.0] - Automatic local discovery
+
+### Added
+
+- `tokentrace scan` discovers and imports local Claude Code and Codex session
+  logs from `~/.claude/projects` and `~/.codex/sessions`, safe to re-run
+- The Claude Code adapter now reads native session transcripts (JSONL) on top of
+  the existing OpenTelemetry export support
+
+### Changed
+
+- Request import is idempotent, so re-importing a source no longer double counts
+  tokens or cost
+- `scan` does not store raw bytes, keeping prompt-bearing native logs out of the
+  store
+- Workspace version moved to 0.11.0
+
 ## [0.10.0] - Codex CLI adapter
 
 ### Added
