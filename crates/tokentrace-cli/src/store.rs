@@ -282,10 +282,10 @@ pub struct ImportCounts {
 }
 
 /// Persist parsed records, their warnings, and the raw source bytes in one
-/// transaction. Sessions, turns, and requests use deterministic ids so a
-/// re-import is idempotent for them.
-// TODO(0.4.0): usage, costs, and tools have no unique key, so re-importing the
-// same file double-counts them; add a replace mode when import grows one.
+/// transaction. Sessions, turns, and requests use deterministic ids, and token
+/// and cost rows are written only for newly inserted requests, so a re-import is
+/// idempotent. Pass empty `raw` to skip storing the source bytes, which `scan`
+/// does so prompt-bearing native logs are never persisted.
 pub fn import_parsed(
     conn: &mut Connection,
     source_id: &str,
@@ -294,7 +294,9 @@ pub fn import_parsed(
     warnings: &[Warning],
 ) -> anyhow::Result<ImportCounts> {
     let tx = conn.transaction()?;
-    put_raw_source(&tx, Some(source_id), Some("application/json"), raw)?;
+    if !raw.is_empty() {
+        put_raw_source(&tx, Some(source_id), Some("application/json"), raw)?;
+    }
 
     for s in &data.sessions {
         tx.execute(
@@ -1268,6 +1270,30 @@ mod tests {
             .query_row("SELECT count(*) FROM costs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(cost_rows, 1);
+    }
+
+    #[test]
+    fn empty_raw_skips_raw_source_storage() {
+        use tokentrace_core::ParsedData;
+
+        let mut conn = memory_store();
+        let src = AgentSource {
+            id: "src1".to_string(),
+            name: "logs".to_string(),
+            source_type: tokentrace_core::SourceType::LocalFile,
+            adapter_id: "codex".to_string(),
+            adapter_version: "0.10.0".to_string(),
+            capabilities: tokentrace_core::Capabilities::default(),
+            imported_at: Some(1),
+        };
+        insert_source(&conn, &src).unwrap();
+
+        // `scan` passes empty raw so prompt-bearing logs are never persisted.
+        import_parsed(&mut conn, "src1", b"", &ParsedData::default(), &[]).unwrap();
+        let raw_rows: i64 = conn
+            .query_row("SELECT count(*) FROM raw_sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw_rows, 0);
     }
 
     #[test]
