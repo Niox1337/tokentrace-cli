@@ -3,6 +3,18 @@
 All notable changes are recorded here. This project follows SemVer. Pre-1.0
 minors may break, and the adapter API stays experimental until 1.0.0.
 
+## [0.10.0] - Codex CLI adapter
+
+### Added
+
+- Codex CLI adapter that imports native rollout session logs with
+  `tokentrace import --adapter codex --path <rollout.jsonl>`, mapping per-turn
+  token counts into the measured band
+
+### Changed
+
+- Workspace version moved to 0.10.0
+
 ## [0.9.1] - TUI tab navigation keys
 
 ### Added

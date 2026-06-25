@@ -7,6 +7,7 @@
 //! `sources add`.
 
 pub mod claude_code;
+pub mod codex;
 
 use tokentrace_core::{Adapter, Capabilities};
 
@@ -25,13 +26,22 @@ pub struct AdapterInfo {
 
 /// The adapters compiled into this build.
 pub fn list() -> Vec<AdapterInfo> {
-    vec![AdapterInfo {
-        id: claude_code::ID,
-        name: claude_code::NAME,
-        status: claude_code::STATUS,
-        version: claude_code::VERSION,
-        capabilities: claude_code::capabilities(),
-    }]
+    vec![
+        AdapterInfo {
+            id: claude_code::ID,
+            name: claude_code::NAME,
+            status: claude_code::STATUS,
+            version: claude_code::VERSION,
+            capabilities: claude_code::capabilities(),
+        },
+        AdapterInfo {
+            id: codex::ID,
+            name: codex::NAME,
+            status: codex::STATUS,
+            version: codex::VERSION,
+            capabilities: codex::capabilities(),
+        },
+    ]
 }
 
 /// Look up a bundled adapter by id.
@@ -43,6 +53,7 @@ pub fn find(id: &str) -> Option<AdapterInfo> {
 pub fn build(id: &str) -> Option<Box<dyn Adapter>> {
     match id {
         claude_code::ID => Some(Box::new(claude_code::ClaudeCode)),
+        codex::ID => Some(Box::new(codex::Codex)),
         _ => None,
     }
 }
