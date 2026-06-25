@@ -67,4 +67,4 @@ and the opt-in sensitive-import gate.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE).
