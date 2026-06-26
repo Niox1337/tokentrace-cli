@@ -17,7 +17,7 @@ mod tui;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -102,7 +102,11 @@ enum AdaptersCommand {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    match cli.command {
+    // Bare `tokentrace` opens the viewer, so the dashboard is the default.
+    let Some(command) = cli.command else {
+        return run_tui();
+    };
+    match command {
         Command::Doctor => doctor(),
         Command::Import {
             adapter,
@@ -125,10 +129,7 @@ fn main() -> anyhow::Result<()> {
             command: AdaptersCommand::List,
         } => adapters_list(),
         Command::Scan => scan()?,
-        Command::Tui => {
-            let conn = store::open(&store::default_store_path())?;
-            tui::run(&conn)?;
-        }
+        Command::Tui => run_tui()?,
         Command::Export { out } => export(out)?,
         Command::Git {
             from,
@@ -138,6 +139,12 @@ fn main() -> anyhow::Result<()> {
         } => git_summary(from, to, cost, currency)?,
     }
     Ok(())
+}
+
+/// Open the store and launch the viewer. Shared by the bare command and `tui`.
+fn run_tui() -> anyhow::Result<()> {
+    let conn = store::open(&store::default_store_path())?;
+    tui::run(&conn)
 }
 
 /// Report the current repo, and when given a range and cost, attribute that cost
