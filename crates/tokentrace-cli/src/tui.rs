@@ -85,7 +85,12 @@ impl App {
 }
 
 /// Open the store viewer, restoring the terminal on the way out even on error.
-pub fn run(conn: &Connection) -> anyhow::Result<()> {
+/// Imports local sessions on launch so the view is current without a manual scan.
+pub fn run(conn: &mut Connection) -> anyhow::Result<()> {
+    println!("Scanning local sessions...");
+    if let Err(e) = crate::scan_store(conn) {
+        eprintln!("scan failed, showing the store as-is: {e}");
+    }
     let mut app = App::load(conn)?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();

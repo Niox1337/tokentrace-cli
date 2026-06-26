@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use rusqlite::Connection;
 use tokentrace_core::{AgentSource, PrivacyLevel, SourceType};
 
 mod adapters;
@@ -143,8 +144,8 @@ fn main() -> anyhow::Result<()> {
 
 /// Open the store and launch the viewer. Shared by the bare command and `tui`.
 fn run_tui() -> anyhow::Result<()> {
-    let conn = store::open(&store::default_store_path())?;
-    tui::run(&conn)
+    let mut conn = store::open(&store::default_store_path())?;
+    tui::run(&mut conn)
 }
 
 /// Report the current repo, and when given a range and cost, attribute that cost
@@ -219,18 +220,35 @@ fn git_summary(
     Ok(())
 }
 
+/// What one adapter's scan imported, for the CLI summary.
+struct AdapterScan {
+    name: String,
+    id: String,
+    files: usize,
+    measured: u64,
+}
+
+/// The result of a scan across all adapters.
+#[derive(Default)]
+pub(crate) struct ScanSummary {
+    per_adapter: Vec<AdapterScan>,
+    /// Files that could not be read or parsed, with the reason.
+    skipped: Vec<String>,
+    total_files: usize,
+    total_measured: u64,
+}
+
 /// Discover local Claude Code and Codex session logs through each adapter's
 /// `detect`, then import what they find. Safe to re-run; the import is
 /// idempotent. The raw bytes are not stored, since native logs carry prompts.
-fn scan() -> anyhow::Result<()> {
-    let mut conn = store::open(&store::default_store_path())?;
+/// Silent so the viewer can call it without printing over the screen.
+pub(crate) fn scan_store(conn: &mut Connection) -> anyhow::Result<ScanSummary> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs() as i64);
 
-    let mut total_files = 0usize;
-    let mut total_measured = 0u64;
+    let mut summary = ScanSummary::default();
     for info in adapters::list() {
         let Some(runner) = adapters::build(info.id) else {
             continue;
@@ -239,26 +257,25 @@ fn scan() -> anyhow::Result<()> {
         if detections.is_empty() {
             continue;
         }
-        println!(
-            "{} ({}): {} session file(s)",
-            info.name,
-            info.id,
-            detections.len()
-        );
         let mut measured = 0u64;
+        let mut files = 0usize;
         for d in &detections {
             let path = PathBuf::from(&d.locator);
             let raw = match std::fs::read(&path) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("  skipped {}: {e}", path.display());
+                    summary
+                        .skipped
+                        .push(format!("skipped {}: {e}", path.display()));
                     continue;
                 }
             };
             let data = match runner.parse(&raw) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("  skipped {}: {e}", path.display());
+                    summary
+                        .skipped
+                        .push(format!("skipped {}: {e}", path.display()));
                     continue;
                 }
             };
@@ -276,20 +293,41 @@ fn scan() -> anyhow::Result<()> {
                 capabilities: info.capabilities,
                 imported_at: now,
             };
-            store::ensure_source(&conn, &source)?;
+            store::ensure_source(conn, &source)?;
             // Empty raw keeps prompt-bearing native logs out of the store.
-            let counts = store::import_parsed(&mut conn, &source.id, b"", &data, &warnings)?;
+            let counts = store::import_parsed(conn, &source.id, b"", &data, &warnings)?;
             measured += counts.measured_tokens;
-            total_files += 1;
+            files += 1;
         }
-        println!("  imported {measured} new measured tokens");
-        total_measured += measured;
+        summary.total_files += files;
+        summary.total_measured += measured;
+        summary.per_adapter.push(AdapterScan {
+            name: info.name.to_string(),
+            id: info.id.to_string(),
+            files,
+            measured,
+        });
     }
+    Ok(summary)
+}
 
-    if total_files == 0 {
+fn scan() -> anyhow::Result<()> {
+    let mut conn = store::open(&store::default_store_path())?;
+    let summary = scan_store(&mut conn)?;
+    for skip in &summary.skipped {
+        eprintln!("  {skip}");
+    }
+    for a in &summary.per_adapter {
+        println!("{} ({}): {} session file(s)", a.name, a.id, a.files);
+        println!("  imported {} new measured tokens", a.measured);
+    }
+    if summary.total_files == 0 {
         println!("No local Claude Code or Codex session logs found.");
     } else {
-        println!("Scanned {total_files} file(s); {total_measured} new measured tokens.");
+        println!(
+            "Scanned {} file(s); {} new measured tokens.",
+            summary.total_files, summary.total_measured
+        );
     }
     Ok(())
 }
