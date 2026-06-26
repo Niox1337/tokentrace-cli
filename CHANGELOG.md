@@ -3,6 +3,22 @@
 All notable changes are recorded here. This project follows SemVer. Pre-1.0
 minors may break, and the adapter API stays experimental until 1.0.0.
 
+## [0.12.0] - Live dashboard
+
+### Added
+
+- Running `tokentrace` with no subcommand opens the viewer, so the dashboard is
+  the default
+- The viewer imports local Claude Code and Codex sessions on launch, so the view
+  is current without a manual scan
+- The viewer reloads on a fixed interval, picking up new sessions while it stays
+  open
+
+### Changed
+
+- `tokentrace tui` behaves the same as the bare command
+- Workspace version moved to 0.12.0
+
 ## [0.11.0] - Automatic local discovery
 
 ### Added

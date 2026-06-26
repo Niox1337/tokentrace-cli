@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "tokentrace-cli"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "tokentrace-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "serde",
