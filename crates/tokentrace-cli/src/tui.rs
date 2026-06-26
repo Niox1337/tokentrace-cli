@@ -148,8 +148,8 @@ fn event_loop<B: Backend>(
             }
         }
         if last_refresh.elapsed() >= REFRESH_EVERY {
-            // ponytail: re-scans every file each tick; add mtime filtering if the
-            // rescan gets slow on large histories. A scan error keeps the UI up.
+            // Re-scans every file each tick; add mtime filtering if the rescan
+            // gets slow on large histories. A scan error keeps the UI up.
             let _ = crate::scan_store(conn);
             app.reload(conn)?;
             sync_detail(app, conn)?;
