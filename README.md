@@ -25,15 +25,20 @@ dependency to install.
 ## Commands
 
 ```bash
+tokentrace                              # open the live viewer (scans on launch, refreshes while open)
 tokentrace doctor                       # environment and store status
 tokentrace adapters list                # bundled adapters and capabilities
 tokentrace import --adapter claude-code --path export.json
 tokentrace scan                         # discover and import local Claude and Codex logs
 tokentrace sources list                 # imported sources
-tokentrace tui                          # browse the store
+tokentrace tui                          # same as the bare command
 tokentrace export --out sessions.jsonl  # newline-delimited JSON per session
 tokentrace git --from <rev> --to HEAD --cost 1234   # attribute a cost across a range
 ```
+
+Running `tokentrace` with no subcommand opens the viewer. It imports local
+Claude and Codex sessions on launch and reloads on a fixed interval, so new
+sessions appear while it stays open.
 
 Import refuses a source whose adapter can expose sensitive content unless you
 pass `--allow-sensitive`, and labels the import when you do.
