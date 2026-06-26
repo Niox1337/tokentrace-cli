@@ -6,6 +6,7 @@
 //! handler stay terminal-free so they can be unit-tested.
 
 use std::io;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -82,6 +83,27 @@ impl App {
             use_color: std::env::var_os("NO_COLOR").is_none(),
         })
     }
+
+    /// Refresh the store-backed data in place, keeping screen and cursor. Called
+    /// on the refresh tick so new sessions appear while the viewer is open. The
+    /// cursor is clamped to the new list and the cached detail is dropped so it
+    /// is re-fetched.
+    pub fn reload(&mut self, conn: &Connection) -> anyhow::Result<()> {
+        self.overview = store::overview(conn)?;
+        self.sources = store::list_sources(conn)?;
+        self.sessions = store::session_summaries(conn)?;
+        self.breakdown = store::breakdown(conn)?;
+        self.warnings = store::warning_breakdown(conn)?;
+        self.usage = store::provider_usage(conn)?;
+        self.selected = clamp_selected(self.selected, self.sessions.len());
+        self.detail = None;
+        Ok(())
+    }
+}
+
+/// Keep a list cursor inside `[0, len)`, collapsing to 0 on an empty list.
+fn clamp_selected(selected: usize, len: usize) -> usize {
+    selected.min(len.saturating_sub(1))
 }
 
 /// Open the store viewer, restoring the terminal on the way out even on error.
@@ -105,18 +127,33 @@ pub fn run(conn: &mut Connection) -> anyhow::Result<()> {
     result
 }
 
+/// How often the viewer re-scans local logs and reloads the store while open.
+const REFRESH_EVERY: Duration = Duration::from_secs(60);
+
 fn event_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    conn: &Connection,
+    conn: &mut Connection,
 ) -> anyhow::Result<()> {
+    let mut last_refresh = Instant::now();
     while !app.should_quit {
         terminal.draw(|f| render(f, app))?;
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                handle_key(app, key.code);
-                sync_detail(app, conn)?;
+        // Poll so the refresh tick fires even when no key is pressed.
+        if event::poll(Duration::from_millis(250))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    handle_key(app, key.code);
+                    sync_detail(app, conn)?;
+                }
             }
+        }
+        if last_refresh.elapsed() >= REFRESH_EVERY {
+            // ponytail: re-scans every file each tick; add mtime filtering if the
+            // rescan gets slow on large histories. A scan error keeps the UI up.
+            let _ = crate::scan_store(conn);
+            app.reload(conn)?;
+            sync_detail(app, conn)?;
+            last_refresh = Instant::now();
         }
     }
     Ok(())
@@ -895,6 +932,17 @@ mod tests {
         let text = plain(&overview_lines(&empty_app()));
         assert!(text.contains("Usage by provider"));
         assert!(text.contains("(no usage yet)"));
+    }
+
+    #[test]
+    fn clamp_selected_keeps_the_cursor_in_range() {
+        // A cursor past the new end snaps to the last row.
+        assert_eq!(clamp_selected(5, 3), 2);
+        // An empty list collapses to 0 without underflowing.
+        assert_eq!(clamp_selected(0, 0), 0);
+        assert_eq!(clamp_selected(4, 0), 0);
+        // A cursor already in range is left alone.
+        assert_eq!(clamp_selected(1, 5), 1);
     }
 
     #[test]
