@@ -127,6 +127,7 @@ struct Build {
     external_hash: String,
     provider: String,
     model: String,
+    repo: Option<String>,
     started_at: Option<i64>,
     ended_at: Option<i64>,
     seq: u32,
@@ -150,6 +151,12 @@ impl Build {
             .and_then(Value::as_str)
             .unwrap_or("openai")
             .to_string();
+        if self.repo.is_none() {
+            self.repo = payload
+                .get("cwd")
+                .and_then(Value::as_str)
+                .and_then(super::repo_from_cwd);
+        }
         let start = payload
             .get("timestamp")
             .and_then(Value::as_str)
@@ -161,6 +168,12 @@ impl Build {
     fn turn_context(&mut self, payload: &Value) {
         if let Some(model) = payload.get("model").and_then(Value::as_str) {
             self.model = model.to_string();
+        }
+        if self.repo.is_none() {
+            self.repo = payload
+                .get("cwd")
+                .and_then(Value::as_str)
+                .and_then(super::repo_from_cwd);
         }
     }
 
@@ -250,7 +263,7 @@ impl Build {
             sessions.push(Session {
                 id: sid,
                 external_id_hash: self.external_hash.clone(),
-                repo: None,
+                repo: self.repo.clone(),
                 branch: None,
                 commit_before: None,
                 commit_after: None,
@@ -330,5 +343,7 @@ mod tests {
         let data = parse_rollout(FIXTURE_ROLLOUT).unwrap();
         let s = &data.sessions[0];
         assert!(s.started_at.unwrap() < s.ended_at.unwrap());
+        // The repo is the final component of the session cwd.
+        assert_eq!(s.repo.as_deref(), Some("redacted"));
     }
 }
