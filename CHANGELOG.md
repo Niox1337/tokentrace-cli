@@ -3,6 +3,15 @@
 All notable changes are recorded here. This project follows SemVer. Pre-1.0
 minors may break, and the adapter API stays experimental until 1.0.0.
 
+## [0.12.1] - Scroll and repo fixes
+
+### Fixed
+
+- The viewer body scrolls with up/down on screens taller than the window, so
+  Sources, Detail, and Breakdown content is no longer clipped
+- Sessions show their repo, taken from the session working directory, instead of
+  reading `(no repo)` everywhere
+
 ## [0.12.0] - Live dashboard
 
 ### Added
