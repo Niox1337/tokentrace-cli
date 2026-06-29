@@ -59,6 +59,8 @@ pub struct App {
     pub screen: Screen,
     /// Cursor into `sessions` for the list and the opened detail.
     pub selected: usize,
+    /// Vertical scroll offset for the current screen body, reset on tab change.
+    pub scroll: u16,
     pub detail: Option<store::SessionDetail>,
     pub should_quit: bool,
     /// Whether to paint the usage bar in colour. Off honours `NO_COLOR`.
@@ -78,6 +80,7 @@ impl App {
             usage: store::provider_usage(conn)?,
             screen: Screen::Overview,
             selected: 0,
+            scroll: 0,
             detail: None,
             should_quit: false,
             use_color: std::env::var_os("NO_COLOR").is_none(),
@@ -162,6 +165,7 @@ fn event_loop<B: Backend>(
 /// Apply one keypress. Navigation only, so it stays terminal-free and testable;
 /// the detail load that an Enter implies is done by [`sync_detail`].
 fn handle_key(app: &mut App, code: KeyCode) {
+    let prev = app.screen;
     match code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('1') => app.screen = Screen::Overview,
@@ -174,11 +178,18 @@ fn handle_key(app: &mut App, code: KeyCode) {
         KeyCode::Up => {
             if app.screen == Screen::Sessions {
                 app.selected = app.selected.saturating_sub(1);
+            } else {
+                app.scroll = app.scroll.saturating_sub(1);
             }
         }
         KeyCode::Down => {
-            if app.screen == Screen::Sessions && !app.sessions.is_empty() {
-                app.selected = (app.selected + 1).min(app.sessions.len() - 1);
+            if app.screen == Screen::Sessions {
+                if !app.sessions.is_empty() {
+                    app.selected = (app.selected + 1).min(app.sessions.len() - 1);
+                }
+            } else {
+                // Upper bound is clamped against the body height in render.
+                app.scroll = app.scroll.saturating_add(1);
             }
         }
         KeyCode::Enter => {
@@ -191,6 +202,9 @@ fn handle_key(app: &mut App, code: KeyCode) {
             _ => app.should_quit = true,
         },
         _ => {}
+    }
+    if app.screen != prev {
+        app.scroll = 0;
     }
 }
 
@@ -222,7 +236,7 @@ fn sync_detail(app: &mut App, conn: &Connection) -> anyhow::Result<()> {
 }
 
 /// Render the current screen: a tab bar, the screen body, and a key footer.
-pub fn render(f: &mut Frame, app: &App) {
+pub fn render(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -242,7 +256,22 @@ pub fn render(f: &mut Frame, app: &App) {
         Screen::Breakdown => (" Breakdown ", breakdown_lines(app)),
         Screen::Warnings => (" Warnings ", warnings_lines(app)),
     };
-    let body = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
+    // Body sits inside a 1-cell border, so the visible height is two rows less.
+    let body_height = chunks[1].height.saturating_sub(2);
+    if app.screen == Screen::Sessions {
+        let sel = app.selected as u16;
+        if sel < app.scroll {
+            app.scroll = sel;
+        } else if body_height > 0 && sel >= app.scroll + body_height {
+            app.scroll = sel - body_height + 1;
+        }
+    }
+    let max_scroll = (lines.len() as u16).saturating_sub(body_height);
+    app.scroll = app.scroll.min(max_scroll);
+
+    let body = Paragraph::new(lines)
+        .scroll((app.scroll, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(body, chunks[1]);
 
     f.render_widget(Paragraph::new(Span::raw(footer(app.screen))), chunks[2]);
@@ -265,8 +294,8 @@ fn tab_bar(current: Screen) -> Line<'static> {
 fn footer(screen: Screen) -> &'static str {
     match screen {
         Screen::Sessions => "1-5/arrows tabs  up/down select  enter open  q quit",
-        Screen::Detail => "1-5 tabs  esc back  q quit",
-        _ => "1-5/arrows tabs  q quit",
+        Screen::Detail => "1-5 tabs  up/down scroll  esc back  q quit",
+        _ => "1-5/arrows tabs  up/down scroll  q quit",
     }
 }
 
@@ -680,6 +709,7 @@ mod tests {
             usage: store::ProviderUsage::default(),
             screen: Screen::Overview,
             selected: 0,
+            scroll: 0,
             detail: None,
             should_quit: false,
             use_color: false,
@@ -770,6 +800,7 @@ mod tests {
             },
             screen: Screen::Detail,
             selected: 0,
+            scroll: 0,
             detail: Some(detail),
             should_quit: false,
             use_color: true,
@@ -904,10 +935,10 @@ mod tests {
         ] {
             let mut app = empty_app();
             app.screen = screen;
-            terminal.draw(|f| render(f, &app)).unwrap();
+            terminal.draw(|f| render(f, &mut app)).unwrap();
             let mut full = populated_app();
             full.screen = screen;
-            terminal.draw(|f| render(f, &full)).unwrap();
+            terminal.draw(|f| render(f, &mut full)).unwrap();
         }
     }
 
@@ -943,6 +974,31 @@ mod tests {
         assert_eq!(clamp_selected(4, 0), 0);
         // A cursor already in range is left alone.
         assert_eq!(clamp_selected(1, 5), 1);
+    }
+
+    #[test]
+    fn arrows_scroll_non_session_screens_and_reset_on_tab_change() {
+        let mut app = empty_app();
+        app.screen = Screen::Breakdown;
+        handle_key(&mut app, KeyCode::Down);
+        handle_key(&mut app, KeyCode::Down);
+        assert_eq!(app.scroll, 2);
+        handle_key(&mut app, KeyCode::Up);
+        assert_eq!(app.scroll, 1);
+        // Switching screens snaps the scroll back to the top.
+        handle_key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn render_clamps_scroll_to_the_content_height() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
+        let mut app = populated_app();
+        app.screen = Screen::Breakdown;
+        app.scroll = 999;
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        // A short window cannot scroll past the last line of content.
+        assert!(app.scroll < 999);
     }
 
     #[test]
