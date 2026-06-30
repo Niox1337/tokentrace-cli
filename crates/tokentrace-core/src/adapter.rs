@@ -13,7 +13,7 @@ use anyhow::Result;
 
 use crate::{
     Capabilities, CostUsage, FileEvent, GitCommit, ModelRequest, Session, TokenUsage, ToolCall,
-    Turn, Warning, WarningKind,
+    Turn, UsageLimit, Warning, WarningKind,
 };
 
 /// A candidate source found by [`Adapter::detect`], with the evidence behind it.
@@ -46,6 +46,8 @@ pub struct ParsedData {
     pub tools: Vec<ToolCall>,
     pub files: Vec<FileEvent>,
     pub commits: Vec<GitCommit>,
+    /// Subscription usage snapshots, when the source reports rate limits.
+    pub usage_limits: Vec<UsageLimit>,
 }
 
 /// Maps one source kind into the TokenTrace model. Experimental until 1.0.0.

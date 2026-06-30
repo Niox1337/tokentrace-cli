@@ -127,6 +127,22 @@ CREATE TABLE warnings (
 );
 ";
 
+/// Added after schema v1. Applied with `CREATE TABLE IF NOT EXISTS` on every open
+/// so fresh and existing stores both get it without a migration framework. One
+/// row per (source, scope); the latest snapshot replaces the previous one.
+const USAGE_LIMITS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS usage_limits (
+    source_id      TEXT NOT NULL,
+    provider       TEXT NOT NULL,
+    scope          TEXT NOT NULL,
+    used_percent   INTEGER NOT NULL,
+    window_minutes INTEGER,
+    resets_at      INTEGER,
+    captured_at    INTEGER,
+    PRIMARY KEY (source_id, scope)
+);
+";
+
 /// Where the SQLite store lives by default, per-platform.
 ///
 /// Windows uses `%LOCALAPPDATA%`, otherwise `$XDG_DATA_HOME` or `~/.local/share`.
@@ -163,6 +179,8 @@ fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(SCHEMA)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
+    // Additive table; idempotent, so it runs for both fresh and existing stores.
+    conn.execute_batch(USAGE_LIMITS_TABLE)?;
     Ok(())
 }
 
@@ -413,6 +431,24 @@ pub fn import_parsed(
         tx.execute(
             "INSERT INTO warnings (source_id, kind, message, context) VALUES (?1, ?2, ?3, ?4)",
             params![source_id, warning_kind_str(w.kind), w.message, w.context],
+        )?;
+    }
+
+    // Replace so a re-scan refreshes the snapshot instead of stacking rows.
+    for u in &data.usage_limits {
+        tx.execute(
+            "INSERT OR REPLACE INTO usage_limits \
+             (source_id, provider, scope, used_percent, window_minutes, resets_at, captured_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                source_id,
+                u.provider,
+                u.scope,
+                u.used_percent,
+                u.window_minutes,
+                u.resets_at,
+                u.captured_at,
+            ],
         )?;
     }
 
@@ -876,6 +912,40 @@ pub fn provider_usage(conn: &Connection) -> anyhow::Result<ProviderUsage> {
     Ok(ProviderUsage { tokens, cost })
 }
 
+/// The latest subscription usage snapshot for one provider window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionRow {
+    pub provider: String,
+    pub scope: String,
+    pub used_percent: i64,
+    pub window_minutes: Option<i64>,
+    pub resets_at: Option<i64>,
+}
+
+/// The most recent subscription usage per (provider, scope), newest capture
+/// winning when several sources reported the same window. Empty when no source
+/// carries rate limits. Sorted by provider then scope for stable output.
+pub fn subscription_usage(conn: &Connection) -> anyhow::Result<Vec<SubscriptionRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT provider, scope, used_percent, window_minutes, resets_at \
+         FROM usage_limits ul \
+         WHERE captured_at = ( \
+             SELECT MAX(captured_at) FROM usage_limits w \
+             WHERE w.provider = ul.provider AND w.scope = ul.scope) \
+         ORDER BY provider, scope",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(SubscriptionRow {
+            provider: r.get(0)?,
+            scope: r.get(1)?,
+            used_percent: r.get(2)?,
+            window_minutes: r.get(3)?,
+            resets_at: r.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 /// One row on the warnings screen: a distinct kind and message, with how many
 /// times it was recorded across all sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1165,6 +1235,7 @@ mod tests {
             }],
             files: Vec::new(),
             commits: Vec::new(),
+            usage_limits: Vec::new(),
         };
         let warnings = vec![Warning::new(
             WarningKind::Redaction,
@@ -1254,6 +1325,7 @@ mod tests {
             tools: Vec::new(),
             files: Vec::new(),
             commits: Vec::new(),
+            usage_limits: Vec::new(),
         };
 
         let first = import_parsed(&mut conn, "src1", b"{}", &data, &[]).unwrap();
@@ -1344,6 +1416,7 @@ mod tests {
             tools: Vec::new(),
             files: Vec::new(),
             commits: Vec::new(),
+            usage_limits: Vec::new(),
         };
         import_parsed(&mut conn, "src1", b"{}", &data, &[]).unwrap();
 
@@ -1447,6 +1520,7 @@ mod tests {
             }],
             files: Vec::new(),
             commits: Vec::new(),
+            usage_limits: Vec::new(),
         };
         let warnings = vec![Warning::new(
             WarningKind::Redaction,
@@ -1604,6 +1678,7 @@ mod tests {
             tools: Vec::new(),
             files: Vec::new(),
             commits: Vec::new(),
+            usage_limits: Vec::new(),
         };
         import_parsed(&mut conn, "src1", b"{}", &data, &[]).unwrap();
 
@@ -1631,5 +1706,57 @@ mod tests {
         assert_eq!(an_cost.amount_minor, 15);
         let oa_cost = usage.cost.iter().find(|c| c.provider == "openai").unwrap();
         assert_eq!(oa_cost.amount_minor, 9);
+    }
+
+    #[test]
+    fn subscription_usage_keeps_the_latest_snapshot_per_window() {
+        use tokentrace_core::UsageLimit;
+
+        let mut conn = memory_store();
+        let src = AgentSource {
+            id: "src1".to_string(),
+            name: "logs".to_string(),
+            source_type: tokentrace_core::SourceType::LocalFile,
+            adapter_id: "codex".to_string(),
+            adapter_version: "0.13.0".to_string(),
+            capabilities: tokentrace_core::Capabilities::default(),
+            imported_at: Some(1),
+        };
+        insert_source(&conn, &src).unwrap();
+
+        let limit = |scope: &str, pct: i64, captured: i64| UsageLimit {
+            provider: "openai".to_string(),
+            scope: scope.to_string(),
+            used_percent: pct,
+            window_minutes: Some(300),
+            resets_at: Some(captured + 3600),
+            captured_at: Some(captured),
+        };
+
+        // First import: an older snapshot.
+        let early = ParsedData {
+            usage_limits: vec![limit("primary", 10, 100)],
+            ..Default::default()
+        };
+        import_parsed(&mut conn, "src1", b"", &early, &[]).unwrap();
+        // Second import: a newer snapshot for the same window plus a new one.
+        let late = ParsedData {
+            usage_limits: vec![limit("primary", 25, 200), limit("secondary", 40, 200)],
+            ..Default::default()
+        };
+        import_parsed(&mut conn, "src1", b"", &late, &[]).unwrap();
+
+        let rows = subscription_usage(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        let primary = rows.iter().find(|r| r.scope == "primary").unwrap();
+        // The newer capture wins, not the stale 10 percent.
+        assert_eq!(primary.used_percent, 25);
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.scope == "secondary")
+                .unwrap()
+                .used_percent,
+            40
+        );
     }
 }

@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use tokentrace_core::{
     Adapter, Capabilities, Confidence, CostUsage, Detection, Fixture, ModelRequest, ParsedData,
-    PrivacyLevel, Session, SessionStatus, TokenUsage, Turn,
+    PrivacyLevel, Session, SessionStatus, TokenUsage, Turn, UsageLimit,
 };
 
 /// One redacted rollout export with two token_count events and a null-info one.
@@ -112,6 +112,7 @@ pub fn parse_rollout(raw: &[u8]) -> Result<ParsedData> {
                 let payload = &rec["payload"];
                 if payload.get("type").and_then(Value::as_str) == Some("token_count") {
                     build.token_count(&payload["info"], ts);
+                    build.rate_limits(&payload["rate_limits"], ts);
                 }
             }
             _ => {}
@@ -135,6 +136,9 @@ struct Build {
     requests: Vec<ModelRequest>,
     tokens: Vec<TokenUsage>,
     costs: Vec<CostUsage>,
+    /// Latest rate-limit snapshot seen in this rollout, replaced as later
+    /// token_count events arrive so the newest plan state wins.
+    usage_limits: Vec<UsageLimit>,
 }
 
 impl Build {
@@ -174,6 +178,41 @@ impl Build {
                 .get("cwd")
                 .and_then(Value::as_str)
                 .and_then(super::repo_from_cwd);
+        }
+    }
+
+    /// Capture the plan usage from a token_count event's `rate_limits`. Each
+    /// snapshot replaces the previous one so the newest plan state wins. The
+    /// rate-limit-only events carry just `limit_id` with no window, so they
+    /// produce no usage and leave the last real snapshot in place.
+    fn rate_limits(&mut self, limits: &Value, ts: Option<i64>) {
+        let provider = if self.provider.is_empty() {
+            "openai".to_string()
+        } else {
+            self.provider.clone()
+        };
+        let mut snapshot = Vec::new();
+        for scope in ["primary", "secondary"] {
+            let window = &limits[scope];
+            let Some(pct) = window.get("used_percent").and_then(Value::as_f64) else {
+                continue;
+            };
+            let resets_at = window
+                .get("resets_in_seconds")
+                .and_then(Value::as_i64)
+                .zip(ts)
+                .map(|(secs, base)| base + secs);
+            snapshot.push(UsageLimit {
+                provider: provider.clone(),
+                scope: scope.to_string(),
+                used_percent: pct.round() as i64,
+                window_minutes: window.get("window_minutes").and_then(Value::as_i64),
+                resets_at,
+                captured_at: ts,
+            });
+        }
+        if !snapshot.is_empty() {
+            self.usage_limits = snapshot;
         }
     }
 
@@ -281,6 +320,7 @@ impl Build {
             tools: Vec::new(),
             files: Vec::new(),
             commits: Vec::new(),
+            usage_limits: self.usage_limits,
         }
     }
 }
@@ -345,5 +385,28 @@ mod tests {
         assert!(s.started_at.unwrap() < s.ended_at.unwrap());
         // The repo is the final component of the session cwd.
         assert_eq!(s.repo.as_deref(), Some("redacted"));
+    }
+
+    #[test]
+    fn rate_limits_become_the_latest_usage_snapshot() {
+        let data = parse_rollout(FIXTURE_ROLLOUT).unwrap();
+        // The limit-id-only event has no windows; the last real snapshot wins.
+        assert_eq!(data.usage_limits.len(), 2);
+        let primary = data
+            .usage_limits
+            .iter()
+            .find(|u| u.scope == "primary")
+            .unwrap();
+        assert_eq!(primary.provider, "openai");
+        assert_eq!(primary.used_percent, 13); // 12.5 rounds to 13
+        assert_eq!(primary.window_minutes, Some(300));
+        // resets_at is the capture time plus resets_in_seconds.
+        assert_eq!(primary.resets_at, primary.captured_at.map(|t| t + 3600));
+        let secondary = data
+            .usage_limits
+            .iter()
+            .find(|u| u.scope == "secondary")
+            .unwrap();
+        assert_eq!(secondary.used_percent, 40);
     }
 }

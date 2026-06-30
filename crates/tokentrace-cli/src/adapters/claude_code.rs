@@ -239,6 +239,7 @@ pub fn parse_native_jsonl(raw: &[u8]) -> Result<ParsedData> {
         tools: Vec::new(),
         files: Vec::new(),
         commits: Vec::new(),
+        usage_limits: Vec::new(),
     })
 }
 
@@ -414,6 +415,7 @@ impl Build {
             tools: self.tools,
             files: Vec::new(),
             commits: Vec::new(),
+            usage_limits: Vec::new(),
         }
     }
 }

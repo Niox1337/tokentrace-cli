@@ -3,6 +3,21 @@
 All notable changes are recorded here. This project follows SemVer. Pre-1.0
 minors may break, and the adapter API stays experimental until 1.0.0.
 
+## [0.13.0] - Subscription usage
+
+### Added
+
+- The overview shows subscription usage per provider window, taken from the rate
+  limits Codex writes to its rollout logs, so plan consumption sits alongside
+  measured tokens
+- A `usage_limits` table and a latest-per-window query keep the newest snapshot
+  without storing prompts or raw bytes
+
+### Notes
+
+- Only Codex logs report plan data locally; Claude Code sessions show no plan
+  usage and a note says so
+
 ## [0.12.1] - Scroll and repo fixes
 
 ### Fixed
