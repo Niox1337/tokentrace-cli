@@ -56,6 +56,8 @@ pub struct App {
     pub warnings: Vec<store::WarningRow>,
     /// Per-provider totals behind the stacked usage bar.
     pub usage: store::ProviderUsage,
+    /// Latest subscription usage per provider window, when a source reports it.
+    pub subscription: Vec<store::SubscriptionRow>,
     pub screen: Screen,
     /// Cursor into `sessions` for the list and the opened detail.
     pub selected: usize,
@@ -78,6 +80,7 @@ impl App {
             breakdown: store::breakdown(conn)?,
             warnings: store::warning_breakdown(conn)?,
             usage: store::provider_usage(conn)?,
+            subscription: store::subscription_usage(conn)?,
             screen: Screen::Overview,
             selected: 0,
             scroll: 0,
@@ -98,6 +101,7 @@ impl App {
         self.breakdown = store::breakdown(conn)?;
         self.warnings = store::warning_breakdown(conn)?;
         self.usage = store::provider_usage(conn)?;
+        self.subscription = store::subscription_usage(conn)?;
         self.selected = clamp_selected(self.selected, self.sessions.len());
         self.detail = None;
         Ok(())
@@ -315,6 +319,8 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
         ),
     ];
     lines.extend(usage_bar_lines(&app.usage, app.use_color));
+    lines.push(Line::raw(""));
+    lines.extend(subscription_lines(&app.subscription));
     lines.push(Line::raw(""));
     if ov.top_sessions.is_empty() {
         lines.push(Line::raw("No sessions yet. Import a source to begin."));
@@ -635,6 +641,40 @@ fn segment_widths(values: &[u64], width: u16) -> Vec<u16> {
     out
 }
 
+/// Subscription usage from sources that report rate limits (Codex today). Each
+/// row is one plan window with the share consumed. A note stands in when no
+/// source carries plan data, since most do not. Reset time is left off until a
+/// clock is threaded into the builders.
+fn subscription_lines(rows: &[store::SubscriptionRow]) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::styled(
+        "Subscription usage",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    if rows.is_empty() {
+        lines.push(Line::raw("  (no plan data; only Codex logs report it)"));
+        return lines;
+    }
+    for r in rows {
+        let window = r.window_minutes.map(window_label).unwrap_or_default();
+        lines.push(Line::raw(format!(
+            "  {} {}  {}% used{}",
+            r.provider, r.scope, r.used_percent, window
+        )));
+    }
+    lines
+}
+
+/// A compact label for a rate-limit window given its length in minutes.
+fn window_label(minutes: i64) -> String {
+    if minutes != 0 && minutes % 1440 == 0 {
+        format!("  ({}d window)", minutes / 1440)
+    } else if minutes != 0 && minutes % 60 == 0 {
+        format!("  ({}h window)", minutes / 60)
+    } else {
+        format!("  ({minutes}m window)")
+    }
+}
+
 fn session_row(s: &store::SessionSummary) -> String {
     let repo = s.repo.as_deref().unwrap_or("(no repo)");
     let branch = s.branch.as_deref().unwrap_or("-");
@@ -707,6 +747,7 @@ mod tests {
             breakdown: store::Breakdown::default(),
             warnings: Vec::new(),
             usage: store::ProviderUsage::default(),
+            subscription: Vec::new(),
             screen: Screen::Overview,
             selected: 0,
             scroll: 0,
@@ -798,6 +839,13 @@ mod tests {
                     currency: Some("USD".to_string()),
                 }],
             },
+            subscription: vec![store::SubscriptionRow {
+                provider: "openai".to_string(),
+                scope: "primary".to_string(),
+                used_percent: 13,
+                window_minutes: Some(300),
+                resets_at: Some(1000),
+            }],
             screen: Screen::Detail,
             selected: 0,
             scroll: 0,
@@ -963,6 +1011,24 @@ mod tests {
         let text = plain(&overview_lines(&empty_app()));
         assert!(text.contains("Usage by provider"));
         assert!(text.contains("(no usage yet)"));
+    }
+
+    #[test]
+    fn overview_shows_subscription_usage_or_a_note() {
+        let text = plain(&overview_lines(&populated_app()));
+        assert!(text.contains("Subscription usage"));
+        assert!(text.contains("openai primary  13% used"));
+        assert!(text.contains("(5h window)"));
+
+        let empty = plain(&overview_lines(&empty_app()));
+        assert!(empty.contains("(no plan data; only Codex logs report it)"));
+    }
+
+    #[test]
+    fn window_label_reads_in_days_hours_or_minutes() {
+        assert_eq!(window_label(10080), "  (7d window)");
+        assert_eq!(window_label(300), "  (5h window)");
+        assert_eq!(window_label(45), "  (45m window)");
     }
 
     #[test]
