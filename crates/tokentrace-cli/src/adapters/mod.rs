@@ -117,6 +117,19 @@ pub(crate) fn iso_to_unix(s: &str) -> Option<i64> {
     Some(days * 86_400 + hour * 3_600 + min * 60 + sec)
 }
 
+/// The repo label for a working directory: its final path component. Both native
+/// Claude transcripts and Codex rollouts carry `cwd`, and the basename is a
+/// stable, non-sensitive name. Returns `None` for an empty or root-only path.
+pub(crate) fn repo_from_cwd(cwd: &str) -> Option<String> {
+    let name = cwd
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// The user's home directory, from `USERPROFILE` on Windows or `HOME` elsewhere.
 pub(crate) fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
@@ -190,6 +203,20 @@ mod tests {
         assert_eq!(iso_to_unix("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(iso_to_unix("2026-03-13T23:48:30.000Z"), Some(1_773_445_710));
         assert_eq!(iso_to_unix("not-a-timestamp"), None);
+    }
+
+    #[test]
+    fn repo_from_cwd_takes_the_final_path_component() {
+        assert_eq!(
+            repo_from_cwd("/home/me/tokentrace-cli").as_deref(),
+            Some("tokentrace-cli")
+        );
+        assert_eq!(
+            repo_from_cwd("C:\\Users\\me\\proj\\").as_deref(),
+            Some("proj")
+        );
+        assert_eq!(repo_from_cwd("/"), None);
+        assert_eq!(repo_from_cwd(""), None);
     }
 
     #[test]

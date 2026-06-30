@@ -156,11 +156,15 @@ pub fn parse_native_jsonl(raw: &[u8]) -> Result<ParsedData> {
             .and_then(Value::as_str)
             .filter(|b| !b.is_empty())
             .map(String::from);
+        let repo = rec
+            .get("cwd")
+            .and_then(Value::as_str)
+            .and_then(super::repo_from_cwd);
 
         let s = sessions.entry(sid.clone()).or_insert_with(|| Session {
             id: sid.clone(),
             external_id_hash: hash,
-            repo: None,
+            repo: repo.clone(),
             branch: branch.clone(),
             commit_before: None,
             commit_after: None,
@@ -170,6 +174,9 @@ pub fn parse_native_jsonl(raw: &[u8]) -> Result<ParsedData> {
         });
         if s.branch.is_none() {
             s.branch = branch;
+        }
+        if s.repo.is_none() {
+            s.repo = repo;
         }
         if let Some(t) = ts {
             if s.started_at.is_none_or(|x| t < x) {
@@ -785,6 +792,8 @@ mod tests {
         assert_eq!(data.sessions.len(), 1);
         assert_eq!(data.requests.len(), 2);
         assert_eq!(data.sessions[0].branch.as_deref(), Some("main"));
+        // The repo is the final component of the transcript cwd.
+        assert_eq!(data.sessions[0].repo.as_deref(), Some("redacted"));
         assert!(data.requests.iter().all(|r| r.provider == "anthropic"));
         assert!(data.requests.iter().all(|r| r.model == "claude-opus-4-8"));
 
