@@ -63,6 +63,23 @@ pub struct TokenUsage {
     pub confidence: Confidence,
 }
 
+/// A point-in-time subscription usage snapshot from a source that reports rate
+/// limits (Codex rollouts). `used_percent` is the share of the window consumed.
+/// Snapshots are the only on-disk signal of plan state, so they carry no cost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageLimit {
+    pub provider: String,
+    /// Which limit window, e.g. `primary` or `secondary`.
+    pub scope: String,
+    /// Share of the window consumed, 0..=100, rounded to whole percent.
+    pub used_percent: i64,
+    pub window_minutes: Option<i64>,
+    /// When the window resets, unix seconds.
+    pub resets_at: Option<Timestamp>,
+    /// When this snapshot was captured, unix seconds.
+    pub captured_at: Option<Timestamp>,
+}
+
 /// A cost value as reported or derived. Imported "cost" stays labelled by source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CostUsage {

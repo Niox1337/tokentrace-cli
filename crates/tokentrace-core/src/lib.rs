@@ -13,7 +13,7 @@ pub use adapter::{validate_parsed, Adapter, Detection, Fixture, ParsedData};
 pub use confidence::Confidence;
 pub use model::{
     CostUsage, DiffSummary, FileEvent, GitCommit, Millis, ModelRequest, Session, SessionStatus,
-    Timestamp, TokenUsage, ToolCall, Turn,
+    Timestamp, TokenUsage, ToolCall, Turn, UsageLimit,
 };
 pub use source::{AgentSource, Capabilities, PrivacyLevel, SourceType};
 pub use warning::{Warning, WarningKind};
