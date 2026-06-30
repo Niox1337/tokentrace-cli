@@ -38,7 +38,9 @@ tokentrace git --from <rev> --to HEAD --cost 1234   # attribute a cost across a 
 
 Running `tokentrace` with no subcommand opens the viewer. It imports local
 Claude and Codex sessions on launch and reloads on a fixed interval, so new
-sessions appear while it stays open.
+sessions appear while it stays open. The overview also shows subscription usage
+per plan window when a source reports it (Codex rollouts carry rate limits;
+Claude Code logs do not, so Claude shows none).
 
 Import refuses a source whose adapter can expose sensitive content unless you
 pass `--allow-sensitive`, and labels the import when you do.
